@@ -95,6 +95,11 @@ impl Paths {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub paths: Paths,
+    /// Where `lantern setup` provisions host tools it cannot get from the
+    /// distribution (kept **outside** the capped data root).
+    pub tools_dir: PathBuf,
+    /// Default nuclei template directory (the `cves` subset).
+    pub nuclei_templates: PathBuf,
     /// Hard cap on the whole data root.
     pub data_cap_bytes: u64,
     /// Hard cap on the log directory.
@@ -171,11 +176,31 @@ fn default_data_root() -> PathBuf {
     PathBuf::from(home).join(".local/share/lantern")
 }
 
+fn default_tools_dir() -> PathBuf {
+    if let Some(p) = env_str("LANTERN_TOOLS_DIR") {
+        return PathBuf::from(p);
+    }
+    if let Some(xdg) = env_str("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("lantern-tools");
+    }
+    let home = env_str("HOME").unwrap_or_else(|| ".".into());
+    PathBuf::from(home).join(".local/share/lantern-tools")
+}
+
 fn default_allowlist() -> Vec<String> {
-    ["nmap", "sqlmap", "nikto", "hydra", "tcpdump"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "nmap",
+        "sqlmap",
+        "nikto",
+        "hydra",
+        "tcpdump",
+        "nuclei",
+        "msfconsole",
+        "john",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Config {
@@ -183,6 +208,17 @@ impl Config {
     pub fn load() -> Result<Self> {
         let root = default_data_root();
         let paths = Paths::new(root);
+        let tools_dir = default_tools_dir();
+        let nuclei_templates = env_str("LANTERN_NUCLEI_TEMPLATES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| tools_dir.join("share").join("nuclei-templates"));
+        // Host binaries live either on the system PATH or in the tools dir that
+        // `lantern setup` provisions (john is a standalone directory).
+        let default_restricted_path = format!(
+            "/usr/local/bin:/usr/bin:/bin:{}:{}",
+            tools_dir.join("john").display(),
+            tools_dir.join("bin").display()
+        );
 
         let concurrency = env_usize("LANTERN_CONCURRENCY", 3).clamp(1, 8);
         let llm_base = env_str("LANTERN_LLM_BASE_URL").unwrap_or_else(|| "https://api.deepseek.com".into());
@@ -209,6 +245,8 @@ impl Config {
 
         Ok(Self {
             paths,
+            tools_dir,
+            nuclei_templates,
             data_cap_bytes: env_u64("LANTERN_DATA_CAP_MB", 1_280) * 1024 * 1024,
             log_cap_bytes: env_u64("LANTERN_LOG_CAP_MB", 200) * 1024 * 1024,
             floor_percent: env_u64("LANTERN_DISK_FLOOR_PERCENT", 20).min(50) as u8,
@@ -217,8 +255,7 @@ impl Config {
             max_output_bytes: env_u64("LANTERN_MAX_OUTPUT_BYTES", 2 * 1024 * 1024),
             child_as_bytes: env_u64("LANTERN_CHILD_MEM_MB", 512) * 1024 * 1024,
             child_cpu_secs: env_u64("LANTERN_CHILD_CPU_SECS", 60),
-            restricted_path: env_str("LANTERN_PATH")
-                .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into()),
+            restricted_path: env_str("LANTERN_PATH").unwrap_or(default_restricted_path),
             allowlist: env_str("LANTERN_ALLOWLIST")
                 .map(|v| {
                     v.split(',')
@@ -299,7 +336,23 @@ mod tests {
     fn allowlist_parsing() {
         // `default_allowlist` order is stable and shell-free.
         let a = default_allowlist();
-        assert_eq!(a, vec!["nmap", "sqlmap", "nikto", "hydra", "tcpdump"]);
+        assert_eq!(
+            a,
+            vec![
+                "nmap", "sqlmap", "nikto", "hydra", "tcpdump", "nuclei", "msfconsole", "john"
+            ]
+        );
+        assert!(a.iter().all(|b| !b.contains('/') && !b.contains(' ')));
+    }
+
+    #[test]
+    fn tools_dir_and_templates_are_outside_the_data_root() {
+        let c = Config::load().unwrap();
+        assert!(!c.tools_dir.starts_with(&c.paths.root));
+        assert!(!c.nuclei_templates.starts_with(&c.paths.root));
+        assert!(c.nuclei_templates.ends_with("nuclei-templates"));
+        // The restricted PATH must reach both provisioning locations.
+        assert!(c.restricted_path.contains(&c.tools_dir.display().to_string()));
     }
 
     #[test]

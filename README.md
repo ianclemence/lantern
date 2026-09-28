@@ -1,12 +1,12 @@
 # Lantern
 
-A native, container-free security assessment agent for small Linux hosts.
+A native security assessment agent for small Linux hosts.
 Lantern runs a scoped, fully audited assessment from the command line: a
 multi-role agent (planner, researcher, coder, pentester, reflector) drives
 in-process tools and a short allowlist of host binaries, keeps everything it
 learns in SQLite, and writes a deterministic markdown report.
 
-It is built for one machine class and sized for it: a Raspberry Pi 5 with
+It is built for one machine class and sized for it: a 4-core aarch64 host with
 8 GiB of RAM and a 30 GB root filesystem.
 
 > ### ⚠️ Safety
@@ -19,13 +19,16 @@ It is built for one machine class and sized for it: a Raspberry Pi 5 with
 > `execve` style argument arrays only - never through a shell. There is no
 > `sh -c`, no `eval`, no string concatenation into a command line.
 >
-> **Active testing is opt-in twice.** `sqlmap` and `hydra` refuse to run unless
-> the flow was started with `--offensive` *and* the target is in scope. Every
-> invocation - binary, argv, cwd, exit code, duration, output size - is written
-> to SQLite and to a JSONL trace file.
+> **Active testing is opt-in twice.** `sqlmap`, `hydra`, `nuclei`,
+> `msfconsole` and `john` refuse to run unless the flow was started with
+> `--offensive` *and* the target is in scope. Every invocation - binary, argv,
+> cwd, exit code, duration, output size - is written to SQLite and to a JSONL
+> trace file.
 >
-> **Lantern does not exploit.** It observes, verifies and reports. It cannot
-> execute code on a target, deploy a payload, or crack hashes.
+> **Nothing offensive runs by default.** A plain `lantern run` observes,
+> verifies and reports. Exploitation, credential attacks and hash cracking
+> exist, but only as explicitly gated, fully audited host-tool calls against
+> targets you declared in scope.
 
 ---
 
@@ -33,58 +36,60 @@ It is built for one machine class and sized for it: a Raspberry Pi 5 with
 
 To be explicit about the boundaries, because they are deliberate:
 
-- **No exploitation framework.** Lantern ships no exploit modules, no payload
-  generation, and no post-exploitation. **Metasploit and hashcat are not
-  integrated and will not be** (they also do not fit this device's storage,
-  RAM and lack of GPU).
-- **No containers.** No Docker, Podman, or sandbox VM - the host has neither
-  the RAM nor the images for it. Isolation comes from an executable allowlist,
-  a cleared environment, a restricted `PATH`, a fresh session per child,
+- **No implicit exploitation.** Lantern carries no exploit code of its own and
+  no payload generator. Anything intrusive is a host tool that must be
+  allowlisted, run one module at a time, gated behind `--offensive`, matched
+  against `--scope`, and recorded argv-for-argv before and after it runs.
+- **Runs directly on the host.** No sandbox runtime, no VM, no background
+  service. Isolation comes from an executable allowlist, a cleared environment,
+  a restricted `PATH`, a fresh session per child,
   `setrlimit` (CPU/AS/FSIZE/NOFILE/NPROC/CORE), wall-clock timeouts, output
   caps and a per-flow working directory.
 - **No web UI, no HTTP server.** A 7.87 GiB host cannot spend 1-2 GiB on a
   browser stack. The CLI is the interface.
-- **No monitoring stack.** No Prometheus, Grafana, Loki, Jaeger, ClickHouse,
-  Redis, MinIO, Neo4j or Graphiti. Logs are `tracing` output into a size-capped
-  rotating file; storage is one SQLite database.
+- **No monitoring stack, no graph database, no object store.** Logs are
+  `tracing` output into a size-capped rotating file; everything else is one
+  SQLite database.
 - **No multi-tenancy, no remote workers, no GPU assumptions.**
 
 ## Device profile
 
 | | |
 |---|---|
-| Board | Raspberry Pi 5 (BCM2712), 4 × Cortex-A76 @ 2.4 GHz, aarch64 |
+| CPU | 4 × Cortex-A76 @ 2.4 GHz, aarch64 |
 | RAM | 7.87 GiB + 2 GiB zram swap (6+ GiB typically available) |
 | Disk | 30.79 GB ext4, **6.16 GB (20%) is a floor Lantern will not touch** |
-| GPU | VideoCore display-only - no compute, so inference is external |
+| GPU | none (display-only silicon) - no compute, so inference is external |
 | OS | Debian 13 (trixie), kernel 6.18, glibc 2.41 |
 | Budgets | data root 1.28 GB, logs 200 MB, concurrency 3, token budget 6000 |
 
 `lantern doctor` re-measures all of this at runtime and prints the numbers it
-actually sees, including free space against the floor.
+actually sees.
 
 ## Build
 
 ```sh
 make            # release build + on-disk and runtime footprint
-make test       # 128 tests, no API spend (scripted provider)
+make test       # 141 tests, no API spend (scripted provider)
 ```
 
 Requires a Rust toolchain (1.85+) and OpenSSL development headers. TLS uses
 the system OpenSSL (`native-tls`), which is what keeps the build free of
 `cmake`, `ring` and a bundled `libclang`.
 
-The release profile is tuned for this board: `lto = "thin"`,
+The release profile is tuned for this device: `lto = "thin"`,
 `codegen-units = 1`, `panic = "abort"`, `strip = true`, `debug = false`.
 
 ## Commands
 
 ```sh
+lantern setup                                  # provision every host tool (once per machine)
+lantern setup --with-metasploit                # ...plus the exploit framework (~754 MB)
 lantern doctor                                  # device, budget, integrations, tools
 lantern run --target example.com \
             --scope "example.com, 93.184.216.0/24"   # full pipeline (read-only)
 lantern run --target 10.10.5.4 --scope 10.10.5.0/24 \
-            --offensive                         # ...and now sqlmap/hydra may run
+            --offensive                         # ...and now the gated tools may run
 lantern run --target 127.0.0.1 --scope 127.0.0.1 --dry-run   # scripted, free
 lantern run ... --roles researcher,pentester    # pick the roles
 lantern flows                                   # what has been run
@@ -94,6 +99,49 @@ lantern tools                                   # every tool and its gate
 lantern gc                                      # retention: compress, prune, vacuum
 ```
 
+## Setup
+
+`lantern setup` is the whole installation story: on a machine that has never
+seen Lantern it detects what is missing and provisions it, and on a machine
+that is already provisioned it reports everything present and changes nothing.
+
+```sh
+lantern setup                  # apt tools + john + nuclei + template set
+lantern setup --with-metasploit # ...also add the exploit framework
+lantern setup --yes             # never prompt (for scripts)
+```
+
+What it does, in order:
+
+1. **distribution packages** - `nmap`, `sqlmap`, `nikto`, `hydra`, `tcpdump`
+   through `apt-get`, but only the ones that are missing, and only if
+   passwordless `sudo` is available. Without `sudo` it prints exactly what is
+   missing instead of failing halfway.
+2. **john (jumbo)** - cloned and built from source into the tools directory,
+   giving 328 formats instead of the handful a distribution package provides.
+   The build residue is deleted afterwards.
+3. **nuclei** - the release binary for the host's architecture, fetched and
+   unpacked into the tools directory.
+4. **template set** - a sparse clone of the CVE templates (4,348 files, 33 MB)
+   rather than the whole repository.
+5. **exploit framework** - opt-in, ~754 MB: signing key, signed repository,
+   package install. It asks before it starts unless `--with-metasploit` or
+   `--yes` was given.
+
+Everything runs through the same executor the agent uses - argv arrays, no
+shell, rlimits, timeouts, one audit row per command - and lands either in your
+package manager's own directories or in the tools directory:
+
+```
+~/.local/share/lantern-tools/
+├── bin/nuclei           # fetched binaries
+├── john/                # standalone jumbo build (john, charsets, rules, wordlists)
+└── share/nuclei-templates/
+```
+
+The tools directory is deliberately **outside** the data root: provisioning
+never competes with logs, artifacts and findings for space.
+
 ### Roles
 
 | Role | What it does | Tools |
@@ -102,7 +150,7 @@ lantern gc                                      # retention: compress, prune, va
 | planner | reorders the plan by risk and effort | - |
 | researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, web search | `dns_lookup`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search` |
 | coder | reproducible check steps and remediation advice | - |
-| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\* |
+| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\* |
 | reflector | judges evidence quality and confidence of every finding | - |
 
 \* requires `--offensive`.
@@ -117,10 +165,27 @@ In-process (no child process): `port_scan`, `dns_lookup`, `http_probe`,
 `tls_inspect`, `whois`, `dir_bruteforce` (built-in 2,419-entry wordlist),
 `web_search` (DuckDuckGo HTML by default, a search API if you configure one).
 
-Allowlisted host binaries: `nmap`, `sqlmap`, `nikto`, `hydra`, `tcpdump`
-(`tcpdump` alone holds `cap_net_raw,cap_net_admin`; the `lantern` binary stays
-unprivileged). Each adapter builds its own argument array - the model never
-supplies raw flags, so it cannot smuggle `-oN /etc/passwd` through.
+Allowlisted host binaries, all provisioned by `lantern setup`:
+
+| Binary | What the adapter does | Gate |
+|---|---|---|
+| `nmap` | connect scan, ports and services | scope |
+| `nikto` | web-server misconfiguration scan | scope |
+| `tcpdump` | capture N packets to a pcap artifact | scope |
+| `sqlmap` | SQL-injection testing against a URL | `--offensive` + scope |
+| `hydra` | password spraying against one service | `--offensive` + scope |
+| `nuclei` | CVE template scan of a URL, JSONL findings | `--offensive` + scope |
+| `msfconsole` | one module (`use`/`set`/`run` or `check`), built as a single argv element | `--offensive` + scope |
+| `john` | offline cracking: wordlist, optional rules, then `--show` | `--offensive` |
+
+Each adapter builds its own argument array - the model never supplies raw
+flags, so it cannot smuggle `-oN /etc/passwd` through. The `msfconsole`
+session string is assembled from a validated module path and character-filtered
+option values, so no option can chain a second console command; `john` writes
+its hashes into the flow's own artifact directory and keeps its pot file in the
+flow working directory; `nuclei` runs with `-no-interactsh` so no callback ever
+leaves for a third party. `tcpdump` alone holds `cap_net_raw,cap_net_admin`;
+the `lantern` binary stays unprivileged.
 
 ## Environment variables
 
@@ -145,8 +210,10 @@ Keys are read from the environment and **never written to disk**.
 | `LANTERN_TASK_TIMEOUT_SECS` | `120` | per-task wall clock |
 | `LANTERN_MAX_OUTPUT_BYTES` | `2097152` | max captured output per command |
 | `LANTERN_CHILD_MEM_MB` / `LANTERN_CHILD_CPU_SECS` | `512` / `60` | child rlimits |
-| `LANTERN_PATH` | `/usr/local/bin:/usr/bin:/bin` | restricted `PATH` for children |
-| `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump` | host binaries that may run |
+| `LANTERN_PATH` | `/usr/local/bin:/usr/bin:/bin` + tools dirs | restricted `PATH` for children |
+| `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john` | host binaries that may run |
+| `LANTERN_TOOLS_DIR` | `~/.local/share/lantern-tools` | where `lantern setup` provisions tools |
+| `LANTERN_NUCLEI_TEMPLATES` | `<tools-dir>/share/nuclei-templates` | template set for `host_nuclei` |
 | `LANTERN_OFFENSIVE` | `0` | same as `--offensive` |
 | `LANTERN_OFFLINE` | `0` | no external calls at all |
 | `LANTERN_TOKEN_BUDGET` | `6000` | context window budget per role |
@@ -165,6 +232,8 @@ Keys are read from the environment and **never written to disk**.
 └── reports/<flow-id>.md
 ```
 
+The tools directory is deliberately **outside** the data root.
+
 Storage rules, in order of preference:
 
 1. writes are refused before the data root reaches `LANTERN_DATA_CAP_MB`;
@@ -175,8 +244,6 @@ Storage rules, in order of preference:
 5. SQLite runs in WAL with `auto_vacuum=INCREMENTAL`, plus a conditional full
    `VACUUM` when free space drops under the threshold;
 6. findings are kept forever - they are the point of the exercise.
-
-`lantern doctor` and `lantern gc` both print current usage against the budget.
 
 ## Memory
 
@@ -189,7 +256,7 @@ the flow over a missing embedder.
 ## Architecture
 
 ```
-lantern-cli     CLI: doctor / run / flows / report / tools / gc
+lantern-cli     CLI: setup / doctor / run / flows / report / tools / gc
 lantern-agent   roles, prompts, cross-role memory, tool loop, judgement, reports
 lantern-tools   native tools, sandboxed host exec, tool registry (one choke point)
 lantern-llm     OpenAI-compatible client, judgement client, embeddings, context window

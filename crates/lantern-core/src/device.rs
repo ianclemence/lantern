@@ -87,8 +87,8 @@ fn os_pretty() -> String {
     "unknown".into()
 }
 
-/// The Pi's VideoCore block is display-only: there is no compute device here.
-/// Detection is intentionally conservative — if we cannot positively identify a
+/// The display controller is display-only: there is no compute device here.
+/// Detection is intentionally conservative - if we cannot positively identify a
 /// usable accelerator we report none, so nothing downstream assumes one exists.
 fn gpu_summary() -> String {
     let mut found: Vec<String> = Vec::new();

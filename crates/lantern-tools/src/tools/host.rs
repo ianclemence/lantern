@@ -44,6 +44,24 @@ pub fn host_tools() -> Vec<HostToolEntry> {
             offensive: true,
             default_args: vec![],
         },
+        HostToolEntry {
+            binary: "nuclei",
+            description: "ACTIVE: nuclei CVE template scan of an in-scope URL (local template set). Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
+        HostToolEntry {
+            binary: "msfconsole",
+            description: "ACTIVE: run one module (use/set/run|check) against an in-scope host. Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
+        HostToolEntry {
+            binary: "john",
+            description: "ACTIVE: offline hash cracking with john (wordlist, optional rules). Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
     ]
 }
 
@@ -84,7 +102,11 @@ pub struct HostTool {
 }
 
 impl HostTool {
-    fn build_args(&self, input: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+    fn build_args(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> anyhow::Result<Vec<String>> {
         match self.entry.binary {
             "nmap" => {
                 let host = super::str_field(input, "host")?;
@@ -244,8 +266,169 @@ impl HostTool {
                 }
                 Ok(args)
             }
+            "nuclei" => {
+                let url = super::str_field(input, "url")?;
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    anyhow::bail!("nuclei needs an http(s) url");
+                }
+                if url.len() > 2_048 {
+                    anyhow::bail!("url too long");
+                }
+                let mut args = vec![
+                    "-t".into(),
+                    ctx.config.nuclei_templates.display().to_string(),
+                    "-u".into(),
+                    url,
+                    "-jsonl".into(),
+                    "-silent".into(),
+                    "-nc".into(),
+                    // Never hand target callbacks to a third-party service.
+                    "-no-interactsh".into(),
+                    "-timeout".into(),
+                    "10".into(),
+                    "-retries".into(),
+                    "1".into(),
+                ];
+                if let Some(sev) = super::opt_str_field(input, "severity") {
+                    if !["info", "low", "medium", "high", "critical"].contains(&sev.as_str()) {
+                        anyhow::bail!("invalid severity filter");
+                    }
+                    args.push("-severity".into());
+                    args.push(sev);
+                }
+                if let Some(tags) = super::opt_str_field(input, "tags") {
+                    if tags.len() > 120
+                        || !tags
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ',' || c == '-')
+                    {
+                        anyhow::bail!("invalid tags");
+                    }
+                    args.push("-tags".into());
+                    args.push(tags);
+                }
+                Ok(args)
+            }
+            "msfconsole" => {
+                let module = super::str_field(input, "module")?;
+                if module.len() > 96
+                    || !module
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "/_-".contains(c))
+                {
+                    anyhow::bail!("invalid module path");
+                }
+                let host = super::str_field(input, "host")?;
+                if host.len() > 128
+                    || !host
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || ".-:/_".contains(c))
+                {
+                    anyhow::bail!("invalid host for msfconsole");
+                }
+                let action =
+                    super::opt_str_field(input, "action").unwrap_or_else(|| "run".into());
+                if action != "run" && action != "check" {
+                    anyhow::bail!("action must be `run` or `check`");
+                }
+
+                // The whole session is one argv element handed to `-x`. Option
+                // values are character-filtered so nothing can chain a second
+                // console command out of them.
+                let mut script = format!("use {module}; ");
+                if let Some(opts) = input.get("options").and_then(|v| v.as_object()) {
+                    if opts.len() > 24 {
+                        anyhow::bail!("too many options (max 24)");
+                    }
+                    for (k, v) in opts {
+                        if k.len() > 32
+                            || !k
+                                .chars()
+                                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                        {
+                            anyhow::bail!("invalid option name `{k}`");
+                        }
+                        if k == "RHOSTS" || k == "RPORT" {
+                            anyhow::bail!("set the target with `host`/`port`, not `{k}`");
+                        }
+                        let val = v
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("option `{k}` must be a string"))?;
+                        let banned = [';', '|', '`', '$', '\n', '\r', '"', '\'', '\\', '&'];
+                        if val.len() > 200 || val.chars().any(|c| banned.contains(&c)) {
+                            anyhow::bail!("option `{k}` contains a rejected character");
+                        }
+                        script.push_str(&format!("set {k} {val}; "));
+                    }
+                }
+                script.push_str(&format!("set RHOSTS {host}; "));
+                if let Some(port) = input.get("port").and_then(|v| v.as_u64()) {
+                    if port == 0 || port > 65_535 {
+                        anyhow::bail!("invalid port");
+                    }
+                    script.push_str(&format!("set RPORT {port}; "));
+                }
+                script.push_str(&format!("{action}; exit"));
+                Ok(vec!["-q".into(), "-x".into(), script])
+            }
             other => anyhow::bail!("no argument builder for `{other}`"),
         }
+    }
+
+    /// john runs in two phases (crack, then `--show`) against a hash file this
+    /// call writes, so it gets its own path instead of `build_args`.
+    fn john_plan(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+        hashfile: &std::path::Path,
+        max_run_secs: u64,
+    ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+        let pot = ctx.workdir.join("lantern.pot");
+        let pot_arg = format!("--pot={}", pot.display());
+        let mut crack = vec![pot_arg.clone()];
+        let mut show = vec!["--show".to_string(), pot_arg];
+
+        if let Some(fmt) = super::opt_str_field(input, "format") {
+            if fmt.len() > 64
+                || !fmt
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
+            {
+                anyhow::bail!("invalid john format name");
+            }
+            crack.push(format!("--format={fmt}"));
+            show.push(format!("--format={fmt}"));
+        }
+
+        let wordlist = match super::opt_str_field(input, "wordlist") {
+            Some(p) => {
+                let path = std::path::PathBuf::from(&p);
+                crate::ctx::require_input_file(&path)?;
+                // Reads stay inside the two directories Lantern owns.
+                if !path.starts_with(&ctx.config.tools_dir)
+                    && !path.starts_with(&ctx.config.paths.root)
+                {
+                    anyhow::bail!("wordlist must live under the tools dir or the data root");
+                }
+                path
+            }
+            None => {
+                let d = ctx.config.tools_dir.join("john").join("password.lst");
+                if !d.is_file() {
+                    anyhow::bail!("no bundled wordlist: pass `wordlist` or run `lantern setup`");
+                }
+                d
+            }
+        };
+        crack.push(format!("--wordlist={}", wordlist.display()));
+        if input.get("rules").and_then(|v| v.as_bool()).unwrap_or(false) {
+            crack.push("--rules".into());
+        }
+        crack.push(format!("--max-run-time={max_run_secs}"));
+        crack.push(hashfile.display().to_string());
+        show.push(hashfile.display().to_string());
+        Ok((crack, show))
     }
 
     fn timeout(&self) -> Duration {
@@ -255,6 +438,9 @@ impl HostTool {
             "sqlmap" => 600,
             "hydra" => 180,
             "tcpdump" => 60,
+            "nuclei" => 600,
+            "msfconsole" => 300,
+            "john" => 360,
             _ => 120,
         })
     }
@@ -331,12 +517,200 @@ impl HostTool {
                         .count()
                 )
             }
+            "nuclei" => {
+                let mut by_sev: Vec<(String, usize)> = Vec::new();
+                let mut total = 0usize;
+                for line in out.stdout.lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if v.get("name").is_some() {
+                            total += 1;
+                            let sev = v
+                                .pointer("/info/severity")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            match by_sev.iter_mut().find(|(s, _)| *s == sev) {
+                                Some((_, n)) => *n += 1,
+                                None => by_sev.push((sev, 1)),
+                            }
+                        }
+                    }
+                }
+                if total == 0 {
+                    "nuclei: finished, no template matched".into()
+                } else {
+                    let detail: Vec<String> = by_sev
+                        .iter()
+                        .map(|(s, n)| format!("{s}: {n}"))
+                        .collect();
+                    format!("nuclei: {total} finding(s) ({})", detail.join(", "))
+                }
+            }
+            "msfconsole" => {
+                let sessions = lines
+                    .iter()
+                    .filter(|l| l.to_ascii_lowercase().contains("session opened"))
+                    .count();
+                if sessions > 0 {
+                    format!("msfconsole: {sessions} session(s) opened")
+                } else if text.contains("Completed") || text.to_ascii_lowercase().contains("checked")
+                {
+                    "msfconsole: module finished without a session".into()
+                } else {
+                    format!("msfconsole: exit {:?}", out.exit_code)
+                }
+            }
+            "john" => {
+                let cracked = john_cracked(&text);
+                if cracked == 0 {
+                    "john: finished, nothing cracked".into()
+                } else {
+                    format!("john: {cracked} hash(es) cracked")
+                }
+            }
             _ => {
                 let first = lines.first().unwrap_or(&"").to_string();
                 format!("{}: exit {:?} {}", self.entry.binary, out.exit_code, first)
             }
         }
     }
+
+    /// john runs in two phases (crack, then `--show`) against a hash file this
+    /// call writes into the flow's own artifact directory.
+    async fn execute_john(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> anyhow::Result<ToolOutput> {
+        let hashes = super::str_field(&input, "hashes")?;
+        let blob = validate_hashes(&hashes)?;
+        let hash_path = ctx.write_artifact("john-hashes.txt", blob.as_bytes())?;
+        let max_run = self.timeout().as_secs().saturating_sub(30).max(30);
+        let (crack, show) = self.john_plan(&input, ctx, &hash_path, max_run)?;
+
+        let started = std::time::Instant::now();
+        let crack_out = exec::run(
+            ExecRequest {
+                tool: self.name(),
+                binary: "john",
+                args: &crack,
+                timeout: self.timeout(),
+                max_output_bytes: ctx.config.max_output_bytes,
+                offensive: self.entry.offensive,
+            },
+            ctx,
+        )
+        .await?;
+
+        // Only spend the second invocation when the first one actually ran.
+        let show_out = if crack_out.timed_out {
+            None
+        } else {
+            Some(
+                exec::run(
+                    ExecRequest {
+                        tool: self.name(),
+                        binary: "john",
+                        args: &show,
+                        timeout: Duration::from_secs(30),
+                        max_output_bytes: ctx.config.max_output_bytes,
+                        offensive: self.entry.offensive,
+                    },
+                    ctx,
+                )
+                .await?,
+            )
+        };
+
+        let mut text = crack_out.combined(8_000);
+        if let Some(s) = &show_out {
+            text.push_str("\n--- john --show ---\n");
+            text.push_str(&s.combined(4_000));
+        }
+        let cracked = john_cracked(&text);
+        let total = blob.lines().filter(|l| !l.trim().is_empty()).count();
+        let summary = if cracked == 0 {
+            format!("john: finished, nothing cracked ({total} hash(es) supplied)")
+        } else {
+            format!("john: {cracked} of {total} hash(es) cracked")
+        };
+
+        let elapsed = started.elapsed().as_millis() as u64;
+        let log = format!("$ john {}\n$ john {}\n{}", crack.join(" "), show.join(" "), text);
+        let log_artifact = ctx.write_artifact("john.log", log.as_bytes()).ok();
+
+        let out_json = json!({
+            "binary": "john",
+            "args": crack,
+            "exit_code": crack_out.exit_code,
+            "timed_out": crack_out.timed_out,
+            "duration_ms": elapsed,
+            "cracked": cracked,
+            "hashes": total,
+            "output": lantern_core::text_clip(&text, 6_000),
+        });
+        let mut o = ToolOutput::new(
+            format!("{summary} (john exit {:?} in {elapsed} ms)", crack_out.exit_code),
+            out_json,
+            crack_out.success(),
+        );
+        let mut artifacts = vec![hash_path];
+        if let Some(a) = log_artifact {
+            artifacts.push(a);
+        }
+        o = o.with_artifacts(artifacts);
+        Ok(o)
+    }
+}
+
+/// Accept a small batch of hash lines: a conservative charset so nothing odd
+/// reaches john's own parser.
+fn validate_hashes(raw: &str) -> anyhow::Result<String> {
+    let mut out = String::new();
+    let mut count = 0usize;
+    for line in raw.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        count += 1;
+        if count > 64 {
+            anyhow::bail!("too many hashes (max 64 per call)");
+        }
+        if l.len() > 512 {
+            anyhow::bail!("hash line too long (max 512 characters)");
+        }
+        if !l.chars().all(|c| c.is_ascii_alphanumeric() || "$*/:+.,=@-".contains(c)) {
+            anyhow::bail!("hash line contains an unsupported character");
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if count == 0 {
+        anyhow::bail!("no hashes supplied");
+    }
+    Ok(out)
+}
+
+/// Read `N password hash(es) cracked` out of john's own output. The word
+/// `cracked` anchors the match, so "Loaded 2 password hashes" is not a count.
+fn john_cracked(text: &str) -> usize {
+    for line in text.lines() {
+        if let Some(cracked_at) = line.find(" cracked") {
+            let head = &line[..cracked_at];
+            if let Some(hash_at) = head.rfind(" password hash") {
+                if let Some(n) = head[..hash_at]
+                    .trim_end()
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|t| t.parse::<usize>().ok())
+                {
+                    return n;
+                }
+            }
+        }
+    }
+    0
 }
 
 impl Tool for HostTool {
@@ -348,6 +722,9 @@ impl Tool for HostTool {
             "tcpdump" => "host_tcpdump",
             "sqlmap" => "host_sqlmap",
             "hydra" => "host_hydra",
+            "nuclei" => "host_nuclei",
+            "msfconsole" => "host_msfconsole",
+            "john" => "host_john",
             _ => "host_unknown",
         }
     }
@@ -408,6 +785,39 @@ impl Tool for HostTool {
                 },
                 "required": ["host", "service", "passlist"]
             }),
+            "nuclei" => json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "in-scope http(s) url"},
+                    "severity": {"type": "string", "description": "info|low|medium|high|critical"},
+                    "tags": {"type": "string", "description": "comma-separated template tags"}
+                },
+                "required": ["url"]
+            }),
+            "msfconsole" => json!({
+                "type": "object",
+                "properties": {
+                    "module": {"type": "string", "description": "e.g. auxiliary/scanner/http/title"},
+                    "host": {"type": "string", "description": "in-scope host, IP or CIDR (RHOSTS)"},
+                    "port": {"type": "integer", "description": "RPORT"},
+                    "action": {"type": "string", "description": "run (default) or check"},
+                    "options": {
+                        "type": "object",
+                        "description": "datastore options, e.g. {\"TARGETURI\": \"/wp-login.php\"}"
+                    }
+                },
+                "required": ["module", "host"]
+            }),
+            "john" => json!({
+                "type": "object",
+                "properties": {
+                    "hashes": {"type": "string", "description": "one hash per line (max 64)"},
+                    "format": {"type": "string", "description": "john format, e.g. raw-md5, NT, bcrypt"},
+                    "wordlist": {"type": "string", "description": "wordlist path under the tools dir or data root"},
+                    "rules": {"type": "boolean", "description": "apply word-mangling rules (slower)"}
+                },
+                "required": ["hashes"]
+            }),
             _ => json!({"type": "object", "properties": {}}),
         }
     }
@@ -422,6 +832,11 @@ impl Tool for HostTool {
         ctx: &'a ToolCtx,
     ) -> crate::exec::BoxFutureTool<'a, anyhow::Result<ToolOutput>> {
         Box::pin(async move {
+            // john is an offline tool: no target, so no scope check applies.
+            if self.entry.binary == "john" {
+                return self.execute_john(input, ctx).await;
+            }
+
             // Scope check on whatever authority the input describes.
             let target = ["host", "url"]
                 .iter()
@@ -437,7 +852,14 @@ impl Tool for HostTool {
                 ctx.check_scope(&auth)?;
             }
 
-            let args = self.build_args(&input)?;
+            if self.entry.binary == "nuclei" && !ctx.config.nuclei_templates.is_dir() {
+                anyhow::bail!(
+                    "nuclei template set not found at {} - run `lantern setup`",
+                    ctx.config.nuclei_templates.display()
+                );
+            }
+
+            let args = self.build_args(&input, ctx)?;
 
             let started = std::time::Instant::now();
             let outcome = exec::run(
@@ -505,43 +927,52 @@ mod tests {
     }
 
     #[test]
-    fn sqlmap_and_hydra_are_gated() {
-        assert!(entry("sqlmap").offensive);
-        assert!(entry("hydra").offensive);
-        assert!(!entry("nmap").offensive);
-        assert!(!entry("nikto").offensive);
-        assert!(!entry("tcpdump").offensive);
+    fn active_tools_are_gated() {
+        for b in ["sqlmap", "hydra", "nuclei", "msfconsole", "john"] {
+            assert!(entry(b).offensive, "{b} must require --offensive");
+        }
+        for b in ["nmap", "nikto", "tcpdump"] {
+            assert!(!entry(b).offensive, "{b} must stay non-offensive");
+        }
+        assert_eq!(entry("nuclei").binary, "nuclei");
     }
 
     #[test]
     fn argument_builders_never_emit_shell_metacharacters() {
+        let ctx = super::super::test_ctx();
         let sqlmap = HostTool { entry: entry("sqlmap") };
         let args = sqlmap
-            .build_args(&json!({"url": "http://10.0.0.1/a?id=1", "level": 3}))
+            .build_args(&json!({"url": "http://10.0.0.1/a?id=1", "level": 3}), &ctx)
             .unwrap();
         assert!(args.contains(&"--level".to_string()));
         assert!(args.contains(&"3".to_string()));
         assert!(args.iter().all(|a| !a.contains(';') && !a.contains('|') && !a.contains('`')));
 
         let nmap = HostTool { entry: entry("nmap") };
-        let args = nmap.build_args(&json!({"host": "10.0.0.1", "ports": "1-100"})).unwrap();
+        let args = nmap
+            .build_args(&json!({"host": "10.0.0.1", "ports": "1-100"}), &ctx)
+            .unwrap();
         assert_eq!(args[0], "-sT");
         assert!(args.contains(&"1-100".to_string()));
         // Model cannot inject arbitrary flags.
-        assert!(nmap.build_args(&json!({"host": "10.0.0.1", "ports": "-oN /etc/x"})).is_err());
+        assert!(nmap
+            .build_args(&json!({"host": "10.0.0.1", "ports": "-oN /etc/x"}), &ctx)
+            .is_err());
         // Host strings are passed verbatim as a single argv element (no shell), and
         // the scope check rejects them before execution.
-        let hostile = nmap.build_args(&json!({"host": "10.0.0.1; rm -rf /"})).unwrap();
+        let hostile = nmap
+            .build_args(&json!({"host": "10.0.0.1; rm -rf /"}), &ctx)
+            .unwrap();
         assert_eq!(hostile.last().unwrap(), "10.0.0.1; rm -rf /");
-        assert_eq!(hostile.len().count_ones(), hostile.len().count_ones());
     }
 
     #[test]
     fn tcpdump_iface_is_validated() {
+        let ctx = super::super::test_ctx();
         let t = HostTool { entry: entry("tcpdump") };
-        assert!(t.build_args(&json!({"iface": "wlan0"})).is_ok());
-        assert!(t.build_args(&json!({"iface": "not; rm -rf /"})).is_err());
-        assert!(t.build_args(&json!({"iface": "doesnotexist0"})).is_err());
+        assert!(t.build_args(&json!({"iface": "wlan0"}), &ctx).is_ok());
+        assert!(t.build_args(&json!({"iface": "not; rm -rf /"}), &ctx).is_err());
+        assert!(t.build_args(&json!({"iface": "doesnotexist0"}), &ctx).is_err());
     }
 
     #[test]
@@ -555,17 +986,155 @@ mod tests {
 
     #[test]
     fn hydra_requires_input_files() {
+        let ctx = super::super::test_ctx();
         let h = HostTool { entry: entry("hydra") };
         assert!(h
-            .build_args(&json!({"host": "10.0.0.1", "service": "ssh", "username": "root"}))
+            .build_args(&json!({"host": "10.0.0.1", "service": "ssh", "username": "root"}), &ctx)
             .is_err(), "missing passlist");
         assert!(h
             .build_args(&json!({"host": "10.0.0.1", "service": "ssh", "username": "root",
-                                "passlist": "/nonexistent-list"}))
+                                "passlist": "/nonexistent-list"}), &ctx)
             .is_err(), "file must exist");
         assert!(h
             .build_args(&json!({"host": "10.0.0.1", "service": "SSH;rm", "username": "root",
-                                "passlist": "/etc/hostname"}))
+                                "passlist": "/etc/hostname"}), &ctx)
             .is_err(), "service charset");
+    }
+
+    #[test]
+    fn nuclei_args_are_fixed_flags_plus_validated_filters() {
+        let ctx = super::super::test_ctx();
+        let n = HostTool { entry: entry("nuclei") };
+        let args = n
+            .build_args(&json!({"url": "https://example.org/login", "severity": "high"}), &ctx)
+            .unwrap();
+        assert!(args.contains(&"-no-interactsh".to_string()), "no third-party callbacks");
+        assert!(args.contains(&"-jsonl".to_string()));
+        assert!(args.contains(&"-severity".to_string()));
+        assert!(args.contains(&"high".to_string()));
+        // Positional target is the url, one argv element.
+        assert!(args.iter().any(|a| a == "https://example.org/login"));
+
+        assert!(n.build_args(&json!({"url": "ftp://x"}), &ctx).is_err(), "scheme");
+        assert!(n
+            .build_args(&json!({"url": "https://example.org", "severity": "urgent"}), &ctx)
+            .is_err(), "severity enum");
+        assert!(n
+            .build_args(&json!({"url": "https://example.org", "tags": "cve, --headless"}), &ctx)
+            .is_err(), "tag charset");
+    }
+
+    #[test]
+    fn msfconsole_script_is_one_argv_element_and_injection_is_rejected() {
+        let ctx = super::super::test_ctx();
+        let m = HostTool { entry: entry("msfconsole") };
+        let args = m
+            .build_args(
+                &json!({
+                    "module": "auxiliary/scanner/http/title",
+                    "host": "10.0.0.5",
+                    "port": 8080,
+                    "action": "check",
+                    "options": {"TARGETURI": "/wp-login.php"}
+                }),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(args, vec![
+            "-q".to_string(),
+            "-x".to_string(),
+            "use auxiliary/scanner/http/title; set TARGETURI /wp-login.php; set RHOSTS 10.0.0.5; \
+             set RPORT 8080; check; exit"
+                .to_string()
+        ]);
+
+        // A value cannot chain a second console command.
+        let err = m
+            .build_args(
+                &json!({"module": "auxiliary/scanner/http/title", "host": "10.0.0.5",
+                        "options": {"TARGETURI": "/x; irb"}}),
+                &ctx,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rejected character"), "{err}");
+        // Module paths are strict, so no option-string smuggling there either.
+        assert!(m
+            .build_args(&json!({"module": "auxiliary/x; run", "host": "10.0.0.5"}), &ctx)
+            .is_err());
+        assert!(m
+            .build_args(&json!({"module": "auxiliary/scanner/http/title", "host": "10.0.0.5",
+                                "action": "rm -rf"}), &ctx)
+            .is_err());
+        // RHOSTS is set from the scope-checked `host`, never from free-form options.
+        assert!(m
+            .build_args(&json!({"module": "auxiliary/scanner/http/title", "host": "10.0.0.5",
+                                "options": {"RHOSTS": "8.8.8.8"}}), &ctx)
+            .is_err());
+    }
+
+    #[test]
+    fn john_hashes_are_validated() {
+        assert!(validate_hashes("").is_err());
+        assert!(validate_hashes("\n  \n").is_err());
+        assert_eq!(validate_hashes("5f4dcc3b5aa765d61d8327deb882cf99").unwrap().lines().count(), 1);
+        assert!(validate_hashes("$2a$05$abc+/=,.*:123").is_ok(), "bcrypt charset");
+        assert!(validate_hashes("deadbeef\n; rm -rf /").is_err(), "shell metachar");
+        let many = (0..65).map(|i| format!("hash{i}")).collect::<Vec<_>>().join("\n");
+        assert!(validate_hashes(&many).is_err(), "batch cap");
+        assert!(validate_hashes(&"x".repeat(600)).is_err(), "line cap");
+    }
+
+    #[test]
+    fn john_plan_uses_local_files_only() {
+        let ctx = super::super::test_ctx();
+        let j = HostTool { entry: entry("john") };
+        let hashfile = ctx.write_artifact("h.txt", b"5f4dcc3b5aa765d61d8327deb882cf99\n").unwrap();
+        let wl = ctx.workdir.join("wl.txt");
+        std::fs::write(&wl, b"password\n123456\n").unwrap();
+
+        let (crack, show) = j
+            .john_plan(
+                &json!({"hashes": "x", "wordlist": wl.display().to_string(), "rules": true,
+                        "format": "raw-md5"}),
+                &ctx,
+                &hashfile,
+                330,
+            )
+            .unwrap();
+        assert!(crack.contains(&"--rules".to_string()));
+        assert!(crack.contains(&"--format=raw-md5".to_string()));
+        assert!(crack.contains(&"--max-run-time=330".to_string()));
+        assert!(crack.iter().any(|a| a.starts_with("--pot=")));
+        assert_eq!(show[0], "--show");
+        assert!(show.iter().any(|a| a == &hashfile.display().to_string()));
+        assert!(crack.iter().all(|a| !a.contains(';') && !a.contains('|')));
+
+        // Reads outside the two directories Lantern owns are refused.
+        assert!(j
+            .john_plan(
+                &json!({"hashes": "x", "wordlist": "/etc/shadow"}),
+                &ctx,
+                &hashfile,
+                60
+            )
+            .is_err());
+        // Format names cannot smuggle argv.
+        assert!(j
+            .john_plan(
+                &json!({"hashes": "x", "wordlist": wl.display().to_string(),
+                        "format": "raw-md5 --rules"}),
+                &ctx,
+                &hashfile,
+                60
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn john_output_parsing_reads_the_cracked_count() {
+        assert_eq!(john_cracked("1 password hash cracked, 0 left"), 1);
+        assert_eq!(john_cracked("Loaded 2 password hashes\n3 password hashes cracked, 1 left"), 3);
+        assert_eq!(john_cracked("Session completed"), 0);
     }
 }

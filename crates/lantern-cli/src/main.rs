@@ -1,8 +1,9 @@
-//! `lantern` - native, container-free security assessment from the CLI.
+//! `lantern` - native security assessment from the CLI.
 
 mod doctor;
 mod misc;
 mod run;
+mod setup;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -14,14 +15,14 @@ use std::path::PathBuf;
 #[command(
     name = "lantern",
     version,
-    about = "Native, container-free security assessment agent for small Linux hosts",
+    about = "Native security assessment agent for small Linux hosts",
     long_about = "Lantern runs a scoped, fully audited security assessment from the \
 command line. Tools run in-process or as allowlisted host binaries with a cleared \
 environment, restricted PATH, rlimits, timeouts, output caps and per-flow working \
-directories. There is no shell, no container runtime and no web UI.\n\n\
+directories. There is no shell, no background service and no web UI.\n\n\
 SAFETY: only assess systems you are authorised to test. Targets outside --scope are \
-refused. Active testing (sqlmap, hydra) additionally requires --offensive, and every \
-invocation is written to SQLite and to a trace file."
+refused. Active testing (sqlmap, hydra, nuclei, msfconsole, john) additionally \
+requires --offensive, and every invocation is written to SQLite and to a trace file."
 )]
 struct Cli {
     /// More log output: -v debug, -vv trace
@@ -36,6 +37,15 @@ struct Cli {
 enum Cmd {
     /// Verify the device, the storage budget and every integration
     Doctor,
+    /// Provision every host tool this build expects (no manual installs)
+    Setup {
+        /// Also install the exploit framework (~754 MB, needs sudo)
+        #[arg(long)]
+        with_metasploit: bool,
+        /// Never prompt: take the defaults
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Run an assessment flow against an in-scope target
     Run {
         /// Target host, IP or URL
@@ -47,7 +57,8 @@ enum Cmd {
         /// Roles to run, e.g. "researcher,pentester" (default: full pipeline)
         #[arg(long)]
         roles: Option<String>,
-        /// Enable active testing (sqlmap, hydra). Audit-logged and scope-gated.
+        /// Enable active testing (sqlmap, hydra, nuclei, msfconsole, john).
+        /// Audit-logged and scope-gated.
         #[arg(long)]
         offensive: bool,
         /// Scripted run: no model calls, nothing is spent
@@ -123,6 +134,16 @@ async fn real_main() -> anyhow::Result<()> {
                             offensive,
                             dry_run,
                             steps,
+                        },
+                    )
+                    .await?;
+                }
+                Cmd::Setup { with_metasploit, yes } => {
+                    setup::run(
+                        config,
+                        setup::Opts {
+                            with_metasploit,
+                            yes,
                         },
                     )
                     .await?;
