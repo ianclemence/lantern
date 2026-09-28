@@ -99,7 +99,8 @@ static ROLES: [Role; 6] = [
     },
     Role {
         id: RoleId::Pentester,
-        mission: "Active verification inside scope; never cross into exploitation.",
+        mission: "Active verification inside scope; intrusive steps only with --offensive, \
+                  and only against declared targets.",
         focus: &[
             "port_scan",
             "dir_bruteforce",
@@ -108,6 +109,9 @@ static ROLES: [Role; 6] = [
             "host_tcpdump",
             "host_sqlmap",
             "host_hydra",
+            "host_nuclei",
+            "host_msfconsole",
+            "host_john",
         ],
         max_steps: 6,
         emits_findings: true,
@@ -164,16 +168,46 @@ mod tests {
 
     #[test]
     fn active_tools_only_reach_the_pentester() {
-        // Belt and braces: offensive-gated host tools must not be in a passive
-        // role's focus list.
+        // Derive the gated set from the registry itself, so a newly added
+        // offensive tool is covered without touching this test.
+        let config = lantern_core::config::Config::load().expect("config");
+        let registry =
+            lantern_tools::registry::Registry::new(&config).expect("registry");
+        let gated: Vec<&str> = registry
+            .tools()
+            .iter()
+            .filter(|t| t.requires_offensive())
+            .map(|t| t.name())
+            .collect();
+        assert!(
+            gated.len() >= 5,
+            "expected the gated host tools in the registry, got {gated:?}"
+        );
+        assert!(
+            gated.contains(&"host_nuclei")
+                && gated.contains(&"host_msfconsole")
+                && gated.contains(&"host_john"),
+            "the new gated tools must be registered: {gated:?}"
+        );
+
         for r in roles() {
             if r.id == RoleId::Pentester {
                 continue;
             }
+            for name in &gated {
+                assert!(
+                    !r.focus.contains(name),
+                    "{} must not be steered at {name}",
+                    r.id
+                );
+            }
+        }
+        // ...and the pentester gets every one of them.
+        let pentester = role(RoleId::Pentester);
+        for name in gated {
             assert!(
-                !r.focus.contains(&"host_sqlmap") && !r.focus.contains(&"host_hydra"),
-                "{} must not be steered at active-attack tools",
-                r.id
+                pentester.focus.contains(&name),
+                "pentester focus is missing {name}"
             );
         }
     }
