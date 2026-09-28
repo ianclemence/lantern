@@ -1,0 +1,23 @@
+[package]
+name = "lantern-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Lantern command line interface"
+
+[[bin]]
+name = "lantern"
+path = "src/main.rs"
+
+[dependencies]
+lantern-core.workspace = true
+lantern-llm.workspace = true
+lantern-tools.workspace = true
+lantern-agent.workspace = true
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

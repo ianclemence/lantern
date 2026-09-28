@@ -1,0 +1,23 @@
+[package]
+name = "lantern-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Multi-role agent runtime, memory and reporting for Lantern"
+
+[dependencies]
+lantern-core.workspace = true
+lantern-llm.workspace = true
+lantern-tools.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+time.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

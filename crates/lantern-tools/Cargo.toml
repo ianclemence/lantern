@@ -1,0 +1,30 @@
+[package]
+name = "lantern-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native tool implementations, sandboxed host-exec and tool registry for Lantern"
+
+[dependencies]
+lantern-core.workspace = true
+lantern-llm.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+native-tls.workspace = true
+tokio-native-tls.workspace = true
+hickory-resolver.workspace = true
+x509-parser.workspace = true
+scraper.workspace = true
+flate2.workspace = true
+regex.workspace = true
+rlimit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
