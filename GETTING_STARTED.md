@@ -31,7 +31,7 @@ sudo apt install build-essential libssl-dev pkg-config
 git clone https://github.com/ianclemence/lantern.git
 cd lantern
 make          # release build, then on-disk and runtime footprint
-make test     # 227 tests, no API spend (scripted provider)
+make test     # 234 tests, no API spend (scripted provider)
 ```
 
 If `cargo` is not on `PATH` yet, prefix with `export PATH="$HOME/.cargo/bin:$PATH"`
@@ -186,6 +186,17 @@ intent card says what was understood - and the safety rule is that the prompt
 can only restrain `--offensive`, never grant it: ask for exploitation without
 the flag and you get reconnaissance plus the flag named; pass the flag with a
 defensive-only prompt and the prompt wins, loudly in both cases.
+
+`chat` is the same flow behind a conversational screen: the transcript stays
+in the terminal's scrollback while a small viewport shows status, live role
+and tool activity, and the input line. `/target`, `/scope`, `/roles`,
+`/offensive`, `/dry-run` and `/steps` set the session; anything else you type
+runs as an instruction. Active testing requested without the session allowing
+it raises an inline card (`1` allows this flow once, `2` or Esc stays
+reconnaissance); a line typed mid-flow is noted for the roles still to run;
+Esc stops the flow at the next step boundary and the flow reports `aborted`
+with what it finished. Roles cannot stop for questions here, so flows run
+non-interactively by design.
 
 ## 5. Reading the results
 

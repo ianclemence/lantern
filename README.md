@@ -74,7 +74,7 @@ actually sees.
 
 ```sh
 make            # release build + on-disk and runtime footprint
-make test       # 227 tests, no API spend (scripted provider)
+make test       # 234 tests, no API spend (scripted provider)
 
 # then any shell can type `lantern`: setup links it into ~/.local/bin
 ./target/release/lantern setup
@@ -102,6 +102,7 @@ lantern run ... --roles researcher,pentester    # pick the roles
 lantern run ... --interactive                   # ...and let a role ask you a question
 lantern ask --target example.com --scope "example.com" \
             --prompt "Check TLS and headers, defensive only"   # instruct in words, not flags
+lantern chat                                  # ...or talk it through: / commands, approvals, Esc aborts
 lantern flows                                   # what has been run
 lantern report flw_abc123                       # markdown report to stdout
 lantern report flw_abc123 --out report.md

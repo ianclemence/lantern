@@ -19,10 +19,24 @@ use lantern_tools::ctx::ToolCtx;
 use lantern_tools::memory::Memory;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// What the operator asked for.
+/// One live progress event from a running flow. The terminal renders these as
+/// they arrive; the plain CLI prints nothing for them.
 #[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    PlanStarted,
+    RoleStarted(RoleId),
+    ToolCalled(String),
+    RoleFinished { role: RoleId, steps: usize, error: bool },
+}
+
+/// Where progress events go. `None` means nobody is watching.
+pub type ProgressSink = std::sync::Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+
+/// What the operator asked for.
+#[derive(Clone)]
 pub struct FlowOptions {
     pub target: String,
     pub scope: String,
@@ -36,6 +50,50 @@ pub struct FlowOptions {
     /// The operator's own instruction, verbatim (`lantern ask`). Stored with
     /// the flow as an artifact; each role sees the condensed head of it.
     pub directive: Option<String>,
+    /// Live progress feed for the terminal. Nothing else reads it.
+    pub progress: Option<ProgressSink>,
+    /// Set to stop the flow at the next step boundary. Checked per model step
+    /// and per tool call; the flow then reports `aborted` with whatever it
+    /// finished, instead of silently running on.
+    pub abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Lines the operator typed while the flow runs. Drained at each step
+    /// boundary into the working set and cross-role memory, so later roles
+    /// act on them.
+    pub steering: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+}
+
+// `progress` and `abort` carry no printable state, so they debug as presence.
+impl std::fmt::Debug for FlowOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlowOptions")
+            .field("target", &self.target)
+            .field("scope", &self.scope)
+            .field("offensive", &self.offensive)
+            .field("roles", &self.roles)
+            .field("max_steps", &self.max_steps)
+            .field("interactive", &self.interactive)
+            .field(
+                "directive",
+                &self.directive.as_ref().map(|d| d.chars().count()),
+            )
+            .field("progress", &self.progress.is_some())
+            .field("abort", &self.abort.is_some())
+            .field("steering", &self.steering.is_some())
+            .finish()
+    }
+}
+
+fn emit(opts: &FlowOptions, ev: ProgressEvent) {
+    if let Some(sink) = &opts.progress {
+        sink(ev);
+    }
+}
+
+fn aborted(opts: &FlowOptions) -> bool {
+    opts.abort
+        .as_ref()
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 impl FlowOptions {
@@ -48,6 +106,9 @@ impl FlowOptions {
             max_steps: None,
             interactive: false,
             directive: None,
+            progress: None,
+            abort: None,
+            steering: None,
         }
     }
 
@@ -149,15 +210,24 @@ pub async fn run_flow(agent: &AgentCtx, opts: FlowOptions) -> anyhow::Result<Flo
     match &outcome {
         Ok(o) => {
             // Status, counters and spend were already on the row before the
-            // report was rendered; only the completion event is left.
-            agent.db.set_flow_status(&flow_id, "completed")?;
+            // report was rendered; only the completion event is left. An
+            // aborted flow keeps its own status rather than being
+            // re-labelled completed here.
+            let status = agent
+                .db
+                .get_flow(&flow_id)?
+                .map(|f| f.status)
+                .unwrap_or_default();
+            if status != "aborted" {
+                agent.db.set_flow_status(&flow_id, "completed")?;
+            }
             agent.db.add_event(
                 Some(&flow_id),
                 None,
                 "info",
                 "flow",
                 &format!(
-                    "flow completed: {} finding(s) in {} ms",
+                    "flow {status}: {} finding(s) in {} ms",
                     o.findings,
                     started.elapsed().as_millis()
                 ),
@@ -217,6 +287,7 @@ async fn run_inner(
             warnings.push(format!("directive not stored: {e:#}"));
         }
     }
+    emit(opts, ProgressEvent::PlanStarted);
     let plan = match plan_phase(agent, target, scope, opts.directive.as_deref()).await {
         Ok(p) => p,
         Err(e) => {
@@ -241,6 +312,7 @@ async fn run_inner(
         if *id == RoleId::Orchestrator {
             continue; // already covered by the plan phase
         }
+        emit(opts, ProgressEvent::RoleStarted(*id));
         let res = match id {
             RoleId::Planner => {
                 let ordered = planner_phase(agent, flow_id, target, &tool_ctx.plan_text()).await;
@@ -283,10 +355,22 @@ async fn run_inner(
                 if let Some(err) = &o.error {
                     warnings.push(format!("{}: {err}", o.role));
                 }
+                emit(
+                    opts,
+                    ProgressEvent::RoleFinished {
+                        role: o.role,
+                        steps: o.steps,
+                        error: o.error.is_some(),
+                    },
+                );
                 outcomes.push(o);
             }
             Err(e) => {
-                warnings.push(format!("{} failed: {e:#}", id));
+                // An abort is reported once, at the break below - not once per
+                // role on the way out.
+                if !aborted(opts) {
+                    warnings.push(format!("{} failed: {e:#}", id));
+                }
                 agent.db.add_event(
                     Some(flow_id),
                     None,
@@ -295,6 +379,14 @@ async fn run_inner(
                     &format!("{id}: {e:#}"),
                     None,
                 )?;
+                emit(
+                    opts,
+                    ProgressEvent::RoleFinished {
+                        role: *id,
+                        steps: 0,
+                        error: true,
+                    },
+                );
                 outcomes.push(RoleOutcome {
                     role: *id,
                     summary: format!("failed: {e:#}"),
@@ -304,6 +396,10 @@ async fn run_inner(
                 });
             }
         }
+        if aborted(opts) {
+            warnings.push("aborted by operator".to_string());
+            break;
+        }
     }
 
     // --- report -----------------------------------------------------------
@@ -312,7 +408,12 @@ async fn run_inner(
     // report claims the flow is still running and quotes whatever fallback the
     // rows can offer instead of what the run measured.
     let footprint = agent.counters.snapshot();
-    agent.db.set_flow_status(flow_id, "completed")?;
+    // An aborted flow is reported as aborted, not completed: the report must
+    // say what actually happened.
+    agent.db.set_flow_status(
+        flow_id,
+        if aborted(opts) { "aborted" } else { "completed" },
+    )?;
     agent.db.set_flow_stats(flow_id, steps, tool_ctx.tool_call_count())?;
     agent.db.set_flow_footprint(
         flow_id,
@@ -437,7 +538,9 @@ async fn run_role(
 
     let looped = tokio::time::timeout(
         budget,
-        role_loop(agent, id, target, scope, &objective, tool_ctx, memory, max_steps),
+        role_loop(
+            agent, id, target, scope, &objective, tool_ctx, memory, max_steps, opts,
+        ),
     )
     .await;
 
@@ -499,6 +602,7 @@ async fn role_loop(
     tool_ctx: &ToolCtx,
     memory: &Memory,
     max_steps: usize,
+    opts: &FlowOptions,
 ) -> anyhow::Result<(String, usize)> {
     let meta = role(id);
     let system = prompts::system(meta, target, scope, tool_ctx.offensive);
@@ -514,6 +618,18 @@ async fn role_loop(
     let mut steps = 0usize;
 
     while steps < max_steps {
+        if aborted(opts) {
+            anyhow::bail!("aborted by operator");
+        }
+        // Steering typed mid-flow joins the working set at the next boundary,
+        // so the roles still to run act on it.
+        if let Some(queue) = &opts.steering {
+            let mut queued = queue.lock().unwrap_or_else(|e| e.into_inner());
+            for line in queued.drain(..) {
+                memory.remember("operator", &line).await;
+                window.push(Message::user(format!("OPERATOR (live steering): {line}")));
+            }
+        }
         let request = ChatRequest::new(window.render(&system))
             .with_tools(defs.clone())
             .max_tokens(agent.config.llm.max_output_tokens)
@@ -541,6 +657,10 @@ async fn role_loop(
         ));
 
         for call in &reply.message.tool_calls {
+            if aborted(opts) {
+                anyhow::bail!("aborted by operator");
+            }
+            emit(opts, ProgressEvent::ToolCalled(call.name.clone()));
             let body = match agent
                 .registry
                 .execute(&call.name, call.args(), tool_ctx)
@@ -788,7 +908,6 @@ mod tests {
             .unwrap();
         assert!(p.contains("Resolve DNS"));
     }
-
     #[tokio::test]
     async fn a_directive_is_stored_and_names_the_flow_options() {
         let agent = scripted(vec![findings_reply()]);
@@ -808,5 +927,53 @@ mod tests {
 
         let flow = agent.db.get_flow(&out.flow_id).unwrap().unwrap();
         assert_eq!(flow.options["directive_chars"].as_u64().unwrap(), 37);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_flow_reports_aborted_with_what_it_finished() {
+        let agent = scripted(vec![findings_reply(), findings_reply()]);
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut opts = FlowOptions::new("127.0.0.1", "127.0.0.1, localhost")
+            .roles(vec![RoleId::Researcher, RoleId::Coder]);
+        opts.abort = Some(abort);
+        let out = run_flow(&agent, opts).await.expect("abort is not an error");
+
+        let flow = agent.db.get_flow(&out.flow_id).unwrap().unwrap();
+        assert_eq!(flow.status, "aborted");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("aborted")),
+            "warnings: {:?}",
+            out.warnings
+        );
+        // The second role never ran: the abort stopped the pipeline.
+        assert!(
+            !out.roles.iter().any(|r| r.role == RoleId::Coder),
+            "roles: {:?}",
+            out.roles.iter().map(|r| r.role).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_events_cover_a_role_from_start_to_finish() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_sink = seen.clone();
+        let agent = scripted(vec![
+            Scripted::ToolCall {
+                name: "port_scan".into(),
+                arguments: r#"{"host":"127.0.0.1","ports":"1"}"#.into(),
+            },
+            findings_reply(),
+        ]);
+        let mut opts = FlowOptions::new("127.0.0.1", "127.0.0.1, localhost")
+            .roles(vec![RoleId::Researcher]);
+        opts.progress = Some(std::sync::Arc::new(move |ev| {
+            sink_sink.lock().unwrap().push(format!("{ev:?}"));
+        }));
+        run_flow(&agent, opts).await.expect("flow runs");
+
+        let log = seen.lock().unwrap().join("\n");
+        assert!(log.contains("RoleStarted(Researcher)"), "{log}");
+        assert!(log.contains("ToolCalled(\"port_scan\")"), "{log}");
+        assert!(log.contains("RoleFinished"), "{log}");
     }
 }

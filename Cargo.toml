@@ -66,6 +66,9 @@ libc = "0.2"
 
 # cli + logging
 clap = { version = "4.5", features = ["derive", "env"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "all-widgets"] }
+crossterm = "0.29"
+unicode-width = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"

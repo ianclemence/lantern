@@ -23,3 +23,6 @@ tracing.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
 zip.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true

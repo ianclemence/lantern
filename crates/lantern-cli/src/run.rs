@@ -83,43 +83,66 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
 
 /// Shared outcome block: `run` and `ask` report a finished flow identically.
 pub(crate) fn print_outcome(agent: &AgentCtx, out: &FlowOutcome) -> anyhow::Result<()> {
+    println!("{}", format_outcome(agent, out)?);
+    Ok(())
+}
+
+/// The same block as text, for surfaces that place it themselves (the
+/// terminal inserts it above its viewport; `print_outcome` prints it).
+pub(crate) fn format_outcome(agent: &AgentCtx, out: &FlowOutcome) -> anyhow::Result<String> {
+    let mut s = String::new();
+    use std::fmt::Write as _;
     // --- outcome -----------------------------------------------------------
     let status = agent
         .db
         .get_flow(&out.flow_id)?
         .map(|f| f.status)
         .unwrap_or_else(|| "unknown".into());
-    println!(
+    writeln!(
+        s,
         "flow {} {} in {:.1}s ({} model step(s))",
         out.flow_id,
         status,
         out.elapsed_ms as f64 / 1000.0,
         out.steps
-    );
+    )
+    .unwrap();
     for r in &out.roles {
         let mark = if r.error.is_some() { "!" } else { "+" };
-        println!(
+        writeln!(
+            s,
             "  {mark} {:<13} {:>2} step(s), {} finding(s): {}",
             r.role.as_str(),
             r.steps,
             r.findings,
             one_line(&r.summary, 110)
-        );
+        )
+        .unwrap();
     }
-    println!("\nfindings: {}", out.findings);
+    writeln!(s, "\nfindings: {}", out.findings).unwrap();
     match &out.report {
-        Some(p) => println!("report  : {}", p.display()),
-        None => println!("report  : NOT WRITTEN (see warnings)"),
+        Some(p) => writeln!(s, "report  : {}", p.display()).unwrap(),
+        None => writeln!(s, "report  : NOT WRITTEN (see warnings)").unwrap(),
     }
-    println!("{}", model_line(agent.dry_run, out.footprint, rate_from_env()));
-    println!("{}", context_line(out.footprint, agent.config.token_budget));
+    writeln!(
+        s,
+        "{}",
+        model_line(agent.dry_run, out.footprint, rate_from_env())
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "{}",
+        context_line(out.footprint, agent.config.token_budget)
+    )
+    .unwrap();
     if !out.warnings.is_empty() {
-        println!("warnings:");
+        writeln!(s, "warnings:").unwrap();
         for w in &out.warnings {
-            println!("  - {w}");
+            writeln!(s, "  - {w}").unwrap();
         }
     }
-    Ok(())
+    Ok(s)
 }
 
 pub(crate) fn one_line(text: &str, max: usize) -> String {

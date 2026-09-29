@@ -1,6 +1,7 @@
 //! `lantern` - native security assessment from the CLI.
 
 mod ask;
+mod chat;
 mod doctor;
 mod misc;
 mod prefs;
@@ -98,6 +99,28 @@ enum Cmd {
         /// terminal, set LANTERN_OPERATOR_ANSWER to reply unattended.
         #[arg(long)]
         interactive: bool,
+    },
+    /// Conversational terminal over the assessment flow
+    Chat {
+        /// Starting target (change it later with /target)
+        #[arg(long)]
+        target: Option<String>,
+        /// Starting scope (change it later with /scope)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Roles to run, e.g. "researcher,pentester" (default: full pipeline)
+        #[arg(long)]
+        roles: Option<String>,
+        /// Enable active testing for the session. A prompt can still restrain
+        /// any single flow, never grant it
+        #[arg(long)]
+        offensive: bool,
+        /// Scripted runs: no model calls, nothing is spent
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap model steps per role (can only lower a role's own cap)
+        #[arg(long)]
+        steps: Option<usize>,
     },
     /// List recorded flows
     Flows {
@@ -202,6 +225,28 @@ async fn real_main() -> anyhow::Result<()> {
                     .await?;
                 }
                 Cmd::Setup => setup::run(config).await?,
+                Cmd::Chat {
+                    target,
+                    scope,
+                    roles,
+                    offensive,
+                    dry_run,
+                    steps,
+                } => {
+                    config.offensive = config.offensive || offensive;
+                    chat::run(
+                        config,
+                        chat::Args {
+                            target,
+                            scope,
+                            roles,
+                            offensive,
+                            dry_run,
+                            steps,
+                        },
+                    )
+                    .await?;
+                }
                 Cmd::Flows { limit } => misc::flows(&config, limit)?,
                 Cmd::Report { flow_id, out } => misc::report(&config, &flow_id, out)?,
                 Cmd::Tools => misc::tools(&config)?,
