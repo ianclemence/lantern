@@ -72,8 +72,8 @@ actually sees.
 make            # release build + on-disk and runtime footprint
 make test       # 198 tests, no API spend (scripted provider)
 
-# then this shell can just type `lantern` anywhere
-export PATH="$HOME/lantern/target/release:$PATH"
+# then any shell can type `lantern`: setup links it into ~/.local/bin
+./target/release/lantern setup
 ```
 
 Requires a Rust toolchain (1.85+) and OpenSSL development headers. TLS uses
@@ -151,6 +151,12 @@ package manager's own directories or in the tools directory:
 ├── john/                # standalone jumbo build (john, charsets, rules, wordlists)
 └── share/nuclei-templates/
 ```
+
+The last step is the operator's own: the binary is linked into `~/.local/bin`,
+so a fresh terminal just types `lantern`. It is a symlink rather than a copy,
+which means a rebuild cannot leave a stale binary behind, and when that
+directory is not searched yet the line to add is printed instead of being
+written into a shell startup file behind your back.
 
 The tools directory is deliberately **outside** the data root: provisioning
 never competes with logs, artifacts and findings for space.

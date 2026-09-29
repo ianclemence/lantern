@@ -259,22 +259,98 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         );
     }
 
-    // The binary is usually still sitting in the build directory: hand over the
-    // PATH line rather than making the operator type the full path forever.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let on_path = std::env::var_os("PATH")
-                .map(|p| std::env::split_paths(&p).any(|d| d == dir))
-                .unwrap_or(false);
-            if !on_path {
-                println!(
-                    "\n  put it on PATH: export PATH=\"{}:$PATH\"",
-                    dir.display()
-                );
-            }
+    // The binary usually still sits in the build directory. Put it on PATH for
+    // real rather than handing over an export line that dies with the shell it
+    // was printed in.
+    println!();
+    install_on_path();
+    Ok(())
+}
+
+// --- getting the binary onto PATH -------------------------------------------
+
+/// One symlink in `~/.local/bin`: the standard per-user binary directory, it
+/// survives every rebuild (cargo rewrites the same path the link points at),
+/// and no shell startup file is edited - when the directory is not searched
+/// yet, the line to add is printed instead of being applied behind the
+/// operator's back.
+fn install_on_path() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(name) = exe.file_name() else {
+        return;
+    };
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    if home.is_empty() {
+        return;
+    }
+    let bin = PathBuf::from(home).join(".local/bin");
+    let link = bin.join(name);
+
+    // Running from the installed copy itself: nothing to link, only to report.
+    if link == exe {
+        report(&bin, &link);
+        return;
+    }
+    // Never take over a real file that happens to be named `lantern`.
+    if let Ok(md) = std::fs::symlink_metadata(&link) {
+        if !md.file_type().is_symlink() {
+            warn(&format!(
+                "{} exists and is not a link to this build - leaving it alone; \
+                 remove it and re-run `lantern setup` to install {}",
+                link.display(),
+                exe.display()
+            ));
+            return;
         }
     }
+
+    match install_link(&bin, &link, &exe) {
+        Ok(()) => report(&bin, &link),
+        Err(e) => warn(&format!("could not install {}: {e:#}", link.display())),
+    }
+}
+
+fn report(bin: &Path, link: &Path) {
+    // The check is about the directory the link went into - not about the
+    // directory the build happens to live in, which is never on PATH and used
+    // to make an installed binary report itself as missing.
+    if path_searches(std::env::var_os("PATH").as_deref(), bin) {
+        ok(&format!("on PATH: {}", link.display()));
+    } else {
+        warn(&format!(
+            "{} is linked but not searched yet - add it once to ~/.bashrc: \
+             export PATH=\"$HOME/.local/bin:$PATH\"",
+            bin.display()
+        ));
+    }
+}
+
+/// Create the directory and point `link` at `exe` in one step (write a
+/// temporary name, rename over the old link) so the command is never missing
+/// mid-update and a rerun simply repoints it.
+fn install_link(bin: &Path, link: &Path, exe: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(bin).with_context(|| format!("creating {}", bin.display()))?;
+    let name = link.file_name().unwrap_or(link.as_os_str());
+    let tmp = bin.join(format!(".{}.new", name.to_string_lossy()));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(exe, &tmp).with_context(|| format!("linking {}", link.display()))?;
+    std::fs::rename(&tmp, link).with_context(|| format!("installing {}", link.display()))?;
     Ok(())
+}
+
+/// Whether `dir` is one of the directories the shell searches. Takes the PATH
+/// as an argument so the rule is testable without mutating the environment;
+/// trailing slashes are ignored, since both spellings name the same directory.
+fn path_searches(path: Option<&std::ffi::OsStr>, dir: &Path) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let target = dir.to_string_lossy().trim_end_matches('/').to_string();
+    std::env::split_paths(path).any(|d| d.to_string_lossy().trim_end_matches('/') == target)
 }
 
 // --- detection helpers -------------------------------------------------------
@@ -823,5 +899,63 @@ mod tests {
         assert!(config.allowlist.starts_with(&before));
         let fresh = Config::load().unwrap();
         assert_eq!(fresh.allowlist, before, "Config::load is unaffected");
+    }
+
+    #[test]
+    fn the_binary_is_linked_once_and_repointed_on_a_rebuild() {
+        let root = test_tmp("install-link");
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join(".local/bin");
+        let link = bin.join("lantern");
+        let build = root.join("lantern/target/release/lantern");
+        std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+        std::fs::write(&build, b"elf").unwrap();
+
+        install_link(&bin, &link, &build).expect("first install");
+        assert_eq!(std::fs::read_link(&link).unwrap(), build);
+        assert!(!bin.join(".lantern.new").exists(), "temporary name left behind");
+
+        // rebuilt somewhere else: the link follows in one step, and there is
+        // no moment where the name is missing
+        let rebuild = root.join("elsewhere/lantern");
+        std::fs::create_dir_all(rebuild.parent().unwrap()).unwrap();
+        std::fs::write(&rebuild, b"elf-again").unwrap();
+        install_link(&bin, &link, &rebuild).expect("reinstall");
+        assert_eq!(std::fs::read_link(&link).unwrap(), rebuild);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_binary_directory_is_created_when_it_is_missing() {
+        let root = test_tmp("install-dir");
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("fresh/bin");
+        let exe = root.join("build/lantern");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"elf").unwrap();
+
+        install_link(&bin, &bin.join("lantern"), &exe).expect("install");
+        assert!(bin.is_dir(), "the directory was created");
+        assert!(std::fs::read_link(bin.join("lantern")).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_path_check_asks_about_the_link_directory_not_the_build_directory() {
+        // The old check compared the *build* directory against PATH, so a
+        // properly installed symlink kept reporting itself as missing.
+        let searched = std::ffi::OsStr::new("/usr/bin:/home/u/.local/bin");
+        assert!(path_searches(Some(searched), Path::new("/home/u/.local/bin")));
+        assert!(!path_searches(
+            Some(searched),
+            Path::new("/home/u/lantern/target/release")
+        ));
+        assert!(!path_searches(None, Path::new("/home/u/.local/bin")));
+        assert!(
+            path_searches(Some(std::ffi::OsStr::new("/home/u/.local/bin/")), Path::new("/home/u/.local/bin")),
+            "a trailing slash names the same directory"
+        );
     }
 }
