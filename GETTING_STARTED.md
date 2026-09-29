@@ -38,7 +38,7 @@ If `cargo` is not on `PATH` yet, prefix with `export PATH="$HOME/.cargo/bin:$PAT
 (or call `~/.cargo/bin/cargo` directly).
 
 That produces `target/release/lantern` - 8,546,696 bytes (8.15 MB), reporting
-`lantern 0.1.4`.
+`lantern 0.1.5`.
 
 ## 2. One command: setup
 
