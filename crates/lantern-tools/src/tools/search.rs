@@ -168,6 +168,156 @@ pub fn encode(s: &str) -> String {
     out
 }
 
+/// NVD's public CVE keyword search: no key, one request, enough for a
+/// researcher to match a product version against known CVEs.
+const NVD_ENDPOINT: &str = "https://services.nvd.nist.gov/rest/json/cves/2.0";
+
+/// Base score out of an NVD `metrics` object (newest scheme first).
+fn nvd_score(metrics: &serde_json::Value) -> Option<f64> {
+    for key in [
+        "cvssMetricV40",
+        "cvssMetricV31",
+        "cvssMetricV30",
+        "cvssMetricV2",
+    ] {
+        if let Some(score) = metrics
+            .get(key)
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("cvssData"))
+            .and_then(|d| d.get("baseScore"))
+            .and_then(|v| v.as_f64())
+        {
+            return Some(score);
+        }
+    }
+    None
+}
+
+/// Turn an NVD 2.0 response into the same shape as every other result,
+/// worst-last so the head of the list is the most severe.
+pub fn parse_nvd(text: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| anyhow::anyhow!("decoding nvd: {e}"))?;
+    let Some(vulns) = parsed.get("vulnerabilities").and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for v in vulns {
+        let Some(cve) = v.get("cve") else { continue };
+        let Some(id) = cve.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let desc = cve
+            .get("descriptions")
+            .and_then(|d| d.as_array())
+            .and_then(|d| {
+                d.iter()
+                    .find(|x| x.get("lang").and_then(|l| l.as_str()) == Some("en"))
+                    .and_then(|x| x.get("value"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("no published description");
+        let score = cve.get("metrics").and_then(nvd_score);
+        let title = match score {
+            Some(s) => format!("{id} (cvss {s})"),
+            None => id.to_string(),
+        };
+        let mut row = json!({
+            "title": title,
+            "url": format!("https://nvd.nist.gov/vuln/detail/{id}"),
+            "snippet": desc,
+        });
+        if let Some(s) = score {
+            row["score"] = json!(s);
+        }
+        out.push(row);
+        if out.len() >= 20 {
+            break;
+        }
+    }
+    out.sort_by(|a, b| {
+        row_score(b)
+            .partial_cmp(&row_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(out)
+}
+
+/// Score carried by a result row, or -1 when the catalogue published none.
+pub fn row_score(row: &serde_json::Value) -> f64 {
+    row.get("score").and_then(|v| v.as_f64()).unwrap_or(-1.0)
+}
+
+async fn nvd_search(
+    client: &reqwest::Client,
+    query: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let url = format!(
+        "{NVD_ENDPOINT}?keywordSearch={}&resultsPerPage=20",
+        encode(query)
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("nvd: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "nvd http {status}: {}",
+            text.chars().take(200).collect::<String>()
+        );
+    }
+    let rows = parse_nvd(&text)?;
+    // NVD keyword search is a loose text match: keep the CVEs that actually
+    // talk about the query, and keep everything if none of them do.
+    let tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|t| t.to_ascii_lowercase())
+        .filter(|t| t.len() >= 3)
+        .collect();
+    if tokens.is_empty() {
+        return Ok(rows);
+    }
+    let relevant: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|r| {
+            let hay = format!(
+                "{} {}",
+                r.get("title").and_then(|v| v.as_str()).unwrap_or_default(),
+                r.get("snippet").and_then(|v| v.as_str()).unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            tokens.iter().any(|t| hay.contains(t.as_str()))
+        })
+        .cloned()
+        .collect();
+    if relevant.is_empty() {
+        Ok(rows)
+    } else {
+        Ok(relevant)
+    }
+}
+
+/// Configured search API when a key is present, otherwise DuckDuckGo.
+async fn web_search(
+    ctx: &ToolCtx,
+    query: &str,
+) -> anyhow::Result<(&'static str, Vec<serde_json::Value>)> {
+    match std::env::var("TAVILY_API_KEY") {
+        Ok(key) if !key.is_empty() => match tavily_search(&ctx.http, &key, query).await {
+            Ok(r) => Ok(("tavily", r)),
+            Err(e) => {
+                tracing::warn!(error = %e, "search api failed, falling back to ddg");
+                ddg_search(&ctx.http, query).await.map(|r| ("duckduckgo", r))
+            }
+        },
+        _ => ddg_search(&ctx.http, query).await.map(|r| ("duckduckgo", r)),
+    }
+}
+
 pub struct WebSearch;
 
 impl Tool for WebSearch {
@@ -177,8 +327,10 @@ impl Tool for WebSearch {
 
     fn description(&self) -> &'static str {
         "Search the public web for an in-scope organization, product or hostname. \
-         Uses the configured search API if a key is set, otherwise the DuckDuckGo \
-         HTML endpoint. Results carry title, url and snippet."
+         mode `general` (default) searches the web; mode `vulnerability` also pulls \
+         matching CVEs from the NVD catalogue with their CVSS scores and puts them \
+         first. Uses the configured search API if a key is set, otherwise the \
+         DuckDuckGo HTML endpoint. Results carry title, url and snippet."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -186,6 +338,11 @@ impl Tool for WebSearch {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "search terms, e.g. \"example.com login\""},
+                "mode": {
+                    "type": "string",
+                    "enum": ["general", "vulnerability"],
+                    "description": "`vulnerability` adds known CVEs for the query (default `general`)"
+                },
                 "max_results": {"type": "integer", "description": "default 10, max 20"}
             },
             "required": ["query"]
@@ -203,33 +360,51 @@ impl Tool for WebSearch {
                 anyhow::bail!("query too long (max 300 chars)");
             }
             let max = super::opt_u64(&input, "max_results", MAX_RESULTS as u64).clamp(1, 20) as usize;
+            let mode = super::opt_str_field(&input, "mode")
+                .map(|m| m.to_ascii_lowercase())
+                .unwrap_or_else(|| "general".to_string());
+            if mode != "general" && mode != "vulnerability" {
+                anyhow::bail!("unknown mode `{mode}`; use `general` or `vulnerability`");
+            }
             let started = Instant::now();
 
             if ctx.config.offline {
                 return Ok(ToolOutput::failed("web search disabled: offline mode"));
             }
 
-            let (provider, results) = match std::env::var("TAVILY_API_KEY") {
-                Ok(key) if !key.is_empty() => {
-                    match tavily_search(&ctx.http, &key, &query).await {
-                        Ok(r) => ("tavily", r),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "search api failed, falling back to ddg");
-                            match ddg_search(&ctx.http, &query).await {
-                                Ok(r) => ("duckduckgo", r),
-                                Err(e2) => return Ok(ToolOutput::failed(format!("search failed: {e2}"))),
-                            }
+            // Vulnerability mode: known CVEs first, public writeups after.
+            let mut nvd_rows = Vec::new();
+            if mode == "vulnerability" {
+                match nvd_search(&ctx.http, &query).await {
+                    Ok(rows) => nvd_rows = rows,
+                    Err(e) => tracing::warn!(error = %e, "nvd lookup failed; web results only"),
+                }
+                nvd_rows.truncate((max / 2).max(1));
+            }
+            let nvd_used = !nvd_rows.is_empty();
+            let mut results = std::mem::take(&mut nvd_rows);
+            let budget = max.saturating_sub(results.len());
+
+            let provider = if budget == 0 {
+                "nvd".to_string()
+            } else {
+                match web_search(ctx, &query).await {
+                    Ok((p, mut rows)) => {
+                        rows.truncate(budget);
+                        results.extend(rows);
+                        if nvd_used {
+                            format!("nvd+{p}")
+                        } else {
+                            p.to_string()
                         }
                     }
-                }
-                _ => match ddg_search(&ctx.http, &query).await {
-                    Ok(r) => ("duckduckgo", r),
+                    Err(e) if nvd_used => {
+                        tracing::warn!(error = %e, "web search failed; nvd results only");
+                        "nvd".to_string()
+                    }
                     Err(e) => return Ok(ToolOutput::failed(format!("search failed: {e}"))),
-                },
+                }
             };
-
-            let mut results = results;
-            results.truncate(max);
             let elapsed = started.elapsed().as_millis() as u64;
 
             let summary = if results.is_empty() {
@@ -251,6 +426,7 @@ impl Tool for WebSearch {
                 summary,
                 json!({
                     "query": query,
+                    "mode": mode,
                     "provider": provider,
                     "results": results,
                     "duration_ms": elapsed,
@@ -299,5 +475,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("too long"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn unknown_mode_is_named_with_its_alternatives() {
+        let ctx = super::super::test_ctx();
+        let err = WebSearch
+            .execute(json!({"query": "apache", "mode": "cvss"}), &ctx)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("vulnerability"), "got: {msg}");
+        assert!(msg.contains("general"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_nvd_into_normal_results() {
+        let body = r#"{
+          "totalResults": 2,
+          "vulnerabilities": [
+            {"cve": {
+              "id": "CVE-2014-0160",
+              "descriptions": [{"lang": "en", "value": "TLS heartbeat read overrun in OpenSSL (Heartbleed)."}]
+            }},
+            {"cve": {
+              "id": "CVE-2021-44228",
+              "descriptions": [
+                {"lang": "es", "value": "traduccion"},
+                {"lang": "en", "value": "Apache Log4j2 JNDI features do not protect against attacker controlled LDAP."}
+              ],
+              "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": 10.0}}]}
+            }}
+          ]
+        }"#;
+        let rows = parse_nvd(body).expect("parse");
+        assert_eq!(rows.len(), 2);
+        // Severity sorts first, whatever order the catalogue answered in.
+        assert_eq!(rows[0]["title"], "CVE-2021-44228 (cvss 10)");
+        assert_eq!(rows[0]["score"], 10.0);
+        assert_eq!(rows[0]["url"], "https://nvd.nist.gov/vuln/detail/CVE-2021-44228");
+        assert!(rows[0]["snippet"].as_str().unwrap().contains("Log4j2"));
+        // No metrics at all: the id alone is still a usable title.
+        assert_eq!(rows[1]["title"], "CVE-2014-0160");
+        assert!(rows[1]["snippet"].as_str().unwrap().contains("Heartbleed"));
+        assert_eq!(row_score(&rows[1]), -1.0);
+
+        assert!(parse_nvd("not json").is_err());
+        assert!(parse_nvd(r#"{"vulnerabilities": []}"#).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the live NVD catalogue; run with --ignored"]
+    async fn vulnerability_mode_is_live() {
+        let ctx = super::super::test_ctx();
+        let out = WebSearch
+            .execute(
+                json!({"query": "log4j", "mode": "vulnerability", "max_results": 6}),
+                &ctx,
+            )
+            .await
+            .expect("search");
+        assert!(out.ok, "{}", out.summary);
+        let provider = out.data["provider"].as_str().unwrap_or_default().to_string();
+        assert!(provider.contains("nvd"), "provider: {provider}");
+        let rows = out.data["results"].as_array().cloned().unwrap_or_default();
+        assert!(!rows.is_empty(), "expected CVEs for log4j: {:?}", out.summary);
+        println!("{} | mode {}", out.summary, out.data["mode"]);
     }
 }

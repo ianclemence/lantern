@@ -164,7 +164,8 @@ gate *before* the tool body runs.
 
 In-process (no child process): `port_scan`, `dns_lookup`, `http_probe`,
 `tls_inspect`, `whois`, `dir_bruteforce` (built-in 2,419-entry wordlist),
-`web_search` (DuckDuckGo HTML by default, a search API if you configure one),
+`web_search` (DuckDuckGo HTML by default, a search API if you configure one;
+`mode: vulnerability` puts matching NVD CVEs and their CVSS scores first),
 `memory_search`, `memory_store`, `ask_operator` (only under `--interactive`,
 and silent unless you set `LANTERN_OPERATOR_ANSWER`).
 
