@@ -62,7 +62,7 @@ To be explicit about the boundaries, because they are deliberate:
 |---|---|
 | CPU | 4 × Cortex-A76 @ 2.4 GHz, aarch64 |
 | RAM | 7.87 GiB + 2 GiB zram swap (6+ GiB typically available) |
-| Disk | 30.79 GB ext4, **6.16 GB (20%) is a floor Lantern will not touch** |
+| Disk | 30.79 GB ext4, **6.16 GB (20%) is a floor `lantern setup` will not cross** |
 | GPU | none (display-only silicon) - no compute, so inference is external |
 | OS | Debian 13 (trixie), kernel 6.18, glibc 2.41 |
 | Budgets | data root 1.28 GB, logs 200 MB, concurrency 3, token budget 6000 |
@@ -248,7 +248,7 @@ order is environment, then file, then preset.
 | `LANTERN_DATA_ROOT` | `~/.local/share/lantern` | single data root |
 | `LANTERN_DATA_CAP_MB` | `1280` | hard cap on the data root |
 | `LANTERN_LOG_CAP_MB` | `200` | cap on the log directory |
-| `LANTERN_DISK_FLOOR_PERCENT` | `20` | filesystem free-space floor |
+| `LANTERN_DISK_FLOOR_PERCENT` | `20` | free space `lantern setup` will not cross |
 | `LANTERN_CONCURRENCY` | `3` | parallel task budget |
 | `LANTERN_TASK_TIMEOUT_SECS` | `120` | per-task wall clock |
 | `LANTERN_MAX_OUTPUT_BYTES` | `2097152` | max captured output per command |
@@ -305,8 +305,10 @@ The tools directory is deliberately **outside** the data root.
 Storage rules, in order of preference:
 
 1. writes are refused before the data root reaches `LANTERN_DATA_CAP_MB`;
-2. the filesystem is never taken below the 20% floor - `lantern run` refuses
-   to start (`lantern gc` still works);
+2. provisioning (`lantern setup`) refuses to start below the 20% floor, because
+   that is the only step that downloads and builds gigabytes; assessments,
+   `chat` and `gc` run at any free space (`lantern doctor` reports where the
+   disk stands);
 3. artifacts are gzip-compressed after 7 days and deleted once compressed;
 4. traces are pruned after 14 days, logs after 30;
 5. SQLite runs in WAL with `auto_vacuum=INCREMENTAL`, plus a conditional full

@@ -168,9 +168,6 @@ async fn real_main() -> anyhow::Result<()> {
         Cmd::Doctor => doctor::run(&config).await?,
         Cmd::Gc => misc::gc(&config)?,
         cmd => {
-            // Everything else can grow the data root: refuse when the free-space
-            // floor would be crossed (`lantern gc` stays available).
-            retention::check_floor(&config)?;
             match cmd {
                 Cmd::Run {
                     target,
@@ -224,7 +221,15 @@ async fn real_main() -> anyhow::Result<()> {
                     )
                     .await?;
                 }
-                Cmd::Setup => setup::run(config).await?,
+                // Setup is the one command that downloads and builds gigabytes
+                // (packages, john from source, template clones), so it is the
+                // only place the free-space floor refuses. Everything else is
+                // bounded by the data-root and log caps, and an already
+                // configured machine must not be blocked from working.
+                Cmd::Setup => {
+                    retention::check_floor(&config)?;
+                    setup::run(config).await?
+                }
                 Cmd::Chat {
                     target,
                     scope,

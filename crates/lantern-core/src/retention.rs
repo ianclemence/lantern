@@ -163,12 +163,18 @@ pub fn startup_line(config: &Config, budget: &Budget) -> String {
 }
 
 /// Refuse to start when the filesystem is already under the floor.
+///
+/// Only `lantern setup` calls this: provisioning downloads packages and builds
+/// from source, so it is the step that can actually consume gigabytes. The
+/// assessment commands are bounded by the data-root and log caps and must not
+/// be blocked on a machine that is already configured.
 pub fn check_floor(config: &Config) -> Result<FsStat> {
     let fs = FsStat::for_path(&config.paths.root)?;
     let floor = fs.floor_bytes(config.floor_percent);
     if fs.free_bytes < floor {
         return Err(crate::CoreError::BudgetExceeded(format!(
-            "filesystem has {:.2} GB free but the {:.1}% floor requires {:.2} GB — free space before running lantern",
+            "filesystem has {:.2} GB free but the {:.1}% floor requires {:.2} GB — \
+             free space before running `lantern setup`",
             fs.free_bytes as f64 / 1e9,
             config.floor_percent,
             floor as f64 / 1e9
