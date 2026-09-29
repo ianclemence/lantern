@@ -149,6 +149,7 @@ impl Registry {
         input: serde_json::Value,
         ctx: &ToolCtx,
     ) -> anyhow::Result<ToolOutput> {
+        ctx.note_tool_call();
         let tool = self
             .get(name)
             .with_context(|| format!("unknown tool `{name}` (available: {:?})", self.names()))?;

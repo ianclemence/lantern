@@ -5,7 +5,7 @@
 //! runtime asks the model to compress the older portion, keeps the newest
 //! `keep_recent` tokens verbatim, and pins the summary as a system message.
 
-use crate::provider::Message;
+use crate::provider::{Message, Role};
 
 #[derive(Debug, Clone)]
 pub struct ContextWindow {
@@ -14,6 +14,24 @@ pub struct ContextWindow {
     keep_recent: usize,
     messages: Vec<Message>,
     summary: Option<String>,
+}
+
+/// Drop leading tool replies after a trim.
+///
+/// Providers reject a `tool` message whose requesting assistant message has
+/// been cut away (DeepSeek: "Messages with role 'tool' must be a response to a
+/// preceding message with 'tool_calls'"), which is exactly what token-based
+/// trimming produces when the boundary lands between a call and its reply.
+/// Only the front is ever cut, so dropping the replies at the front restores
+/// the pairing for the whole remaining slice.
+fn drop_orphan_replies(messages: &mut Vec<Message>) {
+    let cut = messages
+        .iter()
+        .take_while(|m| m.role == Role::Tool)
+        .count();
+    if cut > 0 {
+        messages.drain(..cut);
+    }
 }
 
 impl ContextWindow {
@@ -81,6 +99,7 @@ impl ContextWindow {
             kept.push(m.clone());
         }
         kept.reverse();
+        drop_orphan_replies(&mut kept);
         self.messages = kept;
     }
 
@@ -110,7 +129,9 @@ impl ContextWindow {
             })
             .map(|i| i + 1)
             .unwrap_or(0);
-        out.extend(self.messages[start..].iter().cloned());
+        let mut kept: Vec<Message> = self.messages[start..].to_vec();
+        drop_orphan_replies(&mut kept);
+        out.extend(kept);
         out
     }
 
@@ -141,6 +162,72 @@ pub fn summarization_prompt(transcript: &[Message]) -> Vec<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(id: &str) -> crate::provider::ToolCall {
+        crate::provider::ToolCall {
+            id: id.into(),
+            name: "port_scan".into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    /// What providers insist on: every reply follows the assistant message
+    /// that asked for it.
+    fn assert_pairs_are_intact(transcript: &[Message]) {
+        let mut expect_reply_for: Option<usize> = None;
+        for (i, m) in transcript.iter().enumerate() {
+            match m.role {
+                Role::Tool => {
+                    assert_eq!(
+                        expect_reply_for,
+                        Some(i - 1),
+                        "reply at {i} has no request before it"
+                    );
+                }
+                Role::Assistant if !m.tool_calls.is_empty() => {
+                    expect_reply_for = Some(i);
+                }
+                _ => expect_reply_for = None,
+            }
+        }
+    }
+
+    #[test]
+    fn budget_trimming_never_leaves_a_reply_without_its_request() {
+        let mut cw = ContextWindow::new(400, 400, 80);
+        cw.push(Message::user("objective"));
+        // The oversized request is the one the budget has to drop, which
+        // lands the cut exactly between it and its reply.
+        cw.push(Message::assistant_with_calls("call", vec![call("c1")]));
+        cw.messages[1].content = "x".repeat(1_800);
+        cw.push(Message::tool("c1", "result one"));
+        cw.push(Message::assistant_with_calls("call", vec![call("c2")]));
+        cw.push(Message::tool("c2", "result two"));
+
+        let out = cw.render("system");
+        let transcript = &out[1..]; // past the system prompt
+        assert!(
+            !matches!(transcript.first().map(|m| m.role), Some(Role::Tool)),
+            "window opens on an orphan reply"
+        );
+        assert_pairs_are_intact(transcript);
+    }
+
+    #[test]
+    fn summarizing_drops_replies_whose_request_was_summarized_away() {
+        let mut cw = ContextWindow::new(6_000, 1_000, 50);
+        cw.push(Message::user("objective"));
+        cw.push(Message::assistant_with_calls("call", vec![call("c1")]));
+        cw.push(Message::tool("c1", &"r".repeat(400)));
+
+        cw.apply_summary("earlier work, condensed".into());
+
+        assert!(
+            !matches!(cw.messages.first().map(|m| m.role), Some(Role::Tool)),
+            "summary kept an orphan reply"
+        );
+        assert_pairs_are_intact(&cw.messages);
+    }
 
     #[test]
     fn triggers_summary_only_when_over_threshold() {

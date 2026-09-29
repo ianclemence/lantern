@@ -82,6 +82,8 @@ pub struct FlowOutcome {
     pub roles: Vec<RoleOutcome>,
     pub findings: usize,
     pub steps: usize,
+    /// Tool invocations across every role, failures included.
+    pub tool_calls: usize,
     pub report: Option<PathBuf>,
     pub warnings: Vec<String>,
     pub elapsed_ms: u64,
@@ -138,6 +140,7 @@ pub async fn run_flow(agent: &AgentCtx, opts: FlowOptions) -> anyhow::Result<Flo
     let outcome = run_inner(agent, &flow_id, &target, &scope, &opts, &order).await;
     match &outcome {
         Ok(o) => {
+            agent.db.set_flow_stats(&flow_id, o.steps, o.tool_calls)?;
             agent.db.set_flow_status(&flow_id, "completed")?;
             agent.db.add_event(
                 Some(&flow_id),
@@ -295,6 +298,7 @@ async fn run_inner(
         roles: outcomes,
         findings: findings_count,
         steps,
+        tool_calls: tool_ctx.tool_call_count(),
         report: path,
         warnings,
         elapsed_ms: started.elapsed().as_millis() as u64,

@@ -95,6 +95,28 @@ impl Db {
         })
     }
 
+    /// Record the counters the report quotes: model steps and tool
+    /// invocations. They are merged into the flow's options, so whatever is
+    /// already there (offensive, roles, dry_run) survives.
+    pub fn set_flow_stats(&self, id: &str, steps: usize, tool_calls: usize) -> Result<()> {
+        let mut options = self
+            .get_flow(id)?
+            .ok_or_else(|| crate::CoreError::Other(format!("no such flow: {id}")))?
+            .options;
+        if !options.is_object() {
+            options = serde_json::json!({});
+        }
+        options["steps"] = serde_json::json!(steps);
+        options["tool_calls"] = serde_json::json!(tool_calls);
+        self.with(|c| {
+            c.execute(
+                "UPDATE flows SET options = ?1, updated_at = ?2 WHERE id = ?3",
+                params![options.to_string(), timeutil::now(), id],
+            )?;
+            Ok(())
+        })
+    }
+
     // ---------------------------------------------------------------- tasks
 
     pub fn insert_task(
@@ -645,6 +667,26 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         Db::open(&dir.join("t.db")).expect("open")
+    }
+
+    #[test]
+    fn flow_stats_merge_into_options() {
+        let db = db("stats");
+        db.create_flow(
+            "flw_s",
+            "example.com",
+            "example.com",
+            &serde_json::json!({"offensive": true}),
+        )
+        .unwrap();
+        db.set_flow_stats("flw_s", 11, 15).unwrap();
+
+        let f = db.get_flow("flw_s").unwrap().expect("flow");
+        assert_eq!(f.options["steps"], 11);
+        assert_eq!(f.options["tool_calls"], 15);
+        assert_eq!(f.options["offensive"], true, "existing options survive");
+
+        assert!(db.set_flow_stats("flw_missing", 1, 1).is_err());
     }
 
     #[test]

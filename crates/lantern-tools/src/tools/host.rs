@@ -10,6 +10,10 @@ use crate::registry::{HostToolEntry, Tool, ToolOutput};
 use serde_json::json;
 use std::time::Duration;
 
+/// nikto's own `-maxtime`, kept under the adapter's 300 s timeout so the scan
+/// reports what it found instead of being killed mid-run.
+const NIKTO_MAXTIME_SECS: u64 = 240;
+
 /// All host binaries Lantern knows how to drive. Only the ones present in the
 /// operator's allowlist end up in the registry.
 pub fn host_tools() -> Vec<HostToolEntry> {
@@ -134,17 +138,19 @@ impl HostTool {
             }
             "nikto" => {
                 let host = super::str_field(input, "host")?;
-                let mut args = vec![
-                    "-h".into(),
-                    host,
-                    "-nointeractive".into(),
-                    "-Format".into(),
-                    "txt".into(),
-                ];
+                // `-Format` selects nikto's *file* writer: with no `-o` it
+                // aborts before scanning ("Unable to open '' for write"). The
+                // default screen output is what the executor captures, so the
+                // flag is left out entirely.
+                let mut args = vec!["-h".into(), host, "-nointeractive".into()];
                 if let Some(port) = input.get("port").and_then(|v| v.as_u64()) {
                     args.push("-port".into());
                     args.push(port.to_string());
                 }
+                // nikto's own scan limit, set below the adapter's 300s timeout,
+                // so it finishes and reports instead of being killed mid-run.
+                args.push("-maxtime".into());
+                args.push(NIKTO_MAXTIME_SECS.to_string());
                 Ok(args)
             }
             "tcpdump" => {
@@ -924,6 +930,26 @@ mod tests {
 
     fn entry(binary: &str) -> HostToolEntry {
         host_tools().into_iter().find(|e| e.binary == binary).unwrap()
+    }
+
+    #[test]
+    fn nikto_scans_to_the_screen_and_stops_itself() {
+        let ctx = super::super::test_ctx();
+        let tool = HostTool { entry: entry("nikto") };
+        let args = tool
+            .build_args(&json!({"host": "10.0.0.1", "port": 443}), &ctx)
+            .unwrap();
+
+        assert_eq!(args[0], "-h");
+        assert!(args.windows(2).any(|w| w == ["-port", "443"]), "{args:?}");
+        // `-Format` selects the file writer; with no `-o` nikto aborts with
+        // "Unable to open '' for write" and never scans.
+        assert!(!args.contains(&"-Format".to_string()), "{args:?}");
+        let at = args
+            .iter()
+            .position(|a| a == "-maxtime")
+            .expect("nikto needs its own scan cap");
+        assert_eq!(args[at + 1], NIKTO_MAXTIME_SECS.to_string());
     }
 
     #[test]

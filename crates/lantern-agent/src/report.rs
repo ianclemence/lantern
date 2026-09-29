@@ -59,11 +59,23 @@ pub fn build(db: &Db, flow_id: &str) -> anyhow::Result<String> {
     }
 
     s.push_str("## Summary\n\n");
+    // Counters recorded when the flow finished. Flows that predate them fall
+    // back to what the rows can actually show: child processes and stages.
+    let steps = flow
+        .options
+        .get("steps")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(tasks.len() as u64);
+    let invocations = flow
+        .options
+        .get("tool_calls")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(commands.len() as u64);
     s.push_str(&format!(
         "{} finding(s), {} tool invocation(s), {} model step(s).\n\n",
         findings.len(),
-        commands.len(),
-        tasks.len(),
+        invocations,
+        steps,
     ));
 
     if findings.is_empty() {
@@ -243,6 +255,28 @@ mod tests {
             )
             .unwrap();
         (config, db, flow.id)
+    }
+
+    #[test]
+    fn summary_quotes_the_counters_recorded_at_completion() {
+        let (_c, db, flow_id) = fixture();
+        db.set_flow_stats(&flow_id, 11, 15).unwrap();
+
+        let text = build(&db, &flow_id).unwrap();
+        assert!(
+            text.contains("15 tool invocation(s), 11 model step(s)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn summary_falls_back_to_the_rows_when_no_counters_were_recorded() {
+        let (_c, db, flow_id) = fixture();
+        let text = build(&db, &flow_id).unwrap();
+        assert!(
+            text.contains("0 tool invocation(s), 0 model step(s)"),
+            "{text}"
+        );
     }
 
     #[test]

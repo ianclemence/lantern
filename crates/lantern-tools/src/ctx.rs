@@ -27,6 +27,9 @@ pub struct ToolCtx {
     /// The plan as it currently stands. Roles amend it with `plan_patch` and
     /// later roles are handed the amended version.
     pub plan: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Tool invocations this flow has made. The report quotes it, so it counts
+    /// attempts, failures included.
+    pub tool_calls: Arc<std::sync::atomic::AtomicUsize>,
     pub http: reqwest::Client,
     pub embedder: Arc<dyn Embedder>,
 }
@@ -68,6 +71,7 @@ impl ToolCtx {
             offensive,
             interactive: false,
             plan: Arc::new(std::sync::Mutex::new(Vec::new())),
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             http,
             embedder,
         })
@@ -81,6 +85,17 @@ impl ToolCtx {
     /// The live plan as numbered text, ready for a prompt.
     pub fn plan_text(&self) -> String {
         crate::tools::plan::render_steps(&self.plan.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Record one tool invocation: the report quotes this count.
+    pub fn note_tool_call(&self) {
+        self.tool_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Tool invocations so far, failed ones included.
+    pub fn tool_call_count(&self) -> usize {
+        self.tool_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Cross-role memory for the flow this context belongs to. The namespace is

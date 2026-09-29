@@ -127,20 +127,37 @@ impl AgentCtx {
     }
 
     /// One-shot model call used by the plan phases.
+    /// One-shot completion for the planning and reflection phases.
+    ///
+    /// A reasoning model spends the completion budget thinking before it
+    /// answers: asked for 500 tokens on this host, one returned 500 reasoning
+    /// tokens and an empty string, and the plan with it. So the ask carries
+    /// headroom, and a blank reply is asked for once more at double the
+    /// budget before the caller is told the model said nothing.
     pub async fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
-        let reply = self
-            .provider
-            .chat(
-                lantern_llm::provider::ChatRequest::new(vec![
-                    lantern_llm::provider::Message::system(
-                        "You are Lantern, a security assessment planner. Answer concisely.",
-                    ),
-                    lantern_llm::provider::Message::user(prompt),
-                ])
-                .max_tokens(max_tokens),
-            )
-            .await?;
-        Ok(reply.text().to_string())
+        let mut budget = max_tokens.saturating_mul(4).max(2_048);
+        for attempt in 0..2u8 {
+            let reply = self
+                .provider
+                .chat(
+                    lantern_llm::provider::ChatRequest::new(vec![
+                        lantern_llm::provider::Message::system(
+                            "You are Lantern, a security assessment planner. Answer concisely.",
+                        ),
+                        lantern_llm::provider::Message::user(prompt),
+                    ])
+                    .max_tokens(budget),
+                )
+                .await?;
+            let text = reply.text().to_string();
+            if !text.trim().is_empty() {
+                return Ok(text);
+            }
+            if attempt == 0 {
+                budget = budget.saturating_mul(2).min(8_192);
+            }
+        }
+        anyhow::bail!("model returned no content with {budget} tokens of budget")
     }
 }
 
@@ -162,6 +179,41 @@ mod tests {
         let mut c = Config::load().unwrap();
         c.paths = Paths::new(root);
         c
+    }
+
+    #[tokio::test]
+    async fn complete_asks_again_when_thinking_eats_the_whole_budget() {
+        use lantern_llm::mock::{MockProvider, Scripted};
+        let mock = std::sync::Arc::new(MockProvider::with_script(vec![
+            Scripted::Text(String::new()),
+            Scripted::Text("1. Resolve DNS\n2. Fingerprint TLS".into()),
+        ]));
+        let ctx = AgentCtx::new(config(), "example.com", true)
+            .unwrap()
+            .with_provider(mock.clone());
+
+        let out = ctx.complete("write the plan", 500).await.unwrap();
+        assert!(out.contains("Resolve DNS"), "{out}");
+        assert_eq!(
+            mock.calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the empty reply must be retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_reports_a_model_that_never_answers() {
+        use lantern_llm::mock::{MockProvider, Scripted};
+        let mock = std::sync::Arc::new(MockProvider::with_script(vec![
+            Scripted::Text(String::new()),
+            Scripted::Text(String::new()),
+        ]));
+        let ctx = AgentCtx::new(config(), "example.com", true)
+            .unwrap()
+            .with_provider(mock);
+
+        let err = ctx.complete("write the plan", 500).await.unwrap_err();
+        assert!(err.to_string().contains("no content"), "{err}");
     }
 
     #[test]
