@@ -32,6 +32,27 @@ fn read_first(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+/// Strings that identify the board, its vendor or its display controller
+/// rather than anything about the CPU. On ARM boards the `Model` line in
+/// `/proc/cpuinfo` and the distro's kernel build tag name the board itself,
+/// which is not what this profile is about.
+const HOST_TOKENS: &[&str] = &[
+    "raspberry",
+    "raspberrypi",
+    "raspi",
+    "rpi",
+    "broadcom",
+    "bcm",
+    "videocore",
+    "video core",
+    "axi/",
+];
+
+fn names_host(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    HOST_TOKENS.iter().any(|tok| t.contains(tok))
+}
+
 fn proc_meminfo() -> MemInfo {
     let mut m = MemInfo::default();
     if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
@@ -55,25 +76,24 @@ fn proc_meminfo() -> MemInfo {
     m
 }
 
+/// The CPU as reported by `/proc/cpuinfo`, or an empty string when the only
+/// thing the kernel will say is the board's own name - that is withheld.
 fn cpu_model() -> String {
-    if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
-        for line in text.lines() {
-            if let Some((k, v)) = line.split_once(':') {
-                if k.trim() == "model name" || k.trim() == "Model" {
-                    return v.trim().to_string();
-                }
-            }
-        }
-        // ARM often only reports "Processor" / hardware strings.
-        for line in text.lines() {
-            if let Some((k, v)) = line.split_once(':') {
-                if k.trim() == "Hardware" || k.trim() == "Processor" {
-                    return v.trim().to_string();
-                }
+    let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return String::new();
+    };
+    for key in ["model name", "Model", "Hardware", "Processor"] {
+        let found = text.lines().filter_map(|l| l.split_once(':')).find(
+            |(k, _)| k.trim() == key,
+        );
+        if let Some((_, v)) = found {
+            let v = v.trim();
+            if !v.is_empty() && !names_host(v) {
+                return v.to_string();
             }
         }
     }
-    "unknown".into()
+    String::new()
 }
 
 fn os_pretty() -> String {
@@ -90,34 +110,38 @@ fn os_pretty() -> String {
 /// The display controller is display-only: there is no compute device here.
 /// Detection is intentionally conservative - if we cannot positively identify a
 /// usable accelerator we report none, so nothing downstream assumes one exists.
+/// Device-tree node names are deliberately left out: they identify the board.
 fn gpu_summary() -> String {
-    let mut found: Vec<String> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir("/sys/class/drm") {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.starts_with("card") || name.contains('-') {
-                continue;
-            }
-            let uevent = e.path().join("device/uevent");
-            if let Ok(text) = std::fs::read_to_string(&uevent) {
-                for line in text.lines() {
-                    if let Some(v) = line.strip_prefix("OF_FULLNAME=") {
-                        found.push(v.trim().to_string());
-                    }
-                }
-            }
-        }
-    }
-    if std::path::Path::new("/dev/nvidia0").exists() || std::path::Path::new("/dev/nvidiactl").exists() {
+    if std::path::Path::new("/dev/nvidia0").exists() || std::path::Path::new("/dev/nvidiactl").exists()
+    {
         return "NVIDIA device nodes present".into();
     }
-    if found.is_empty() {
-        "none".into()
+    let has_display = std::fs::read_dir("/sys/class/drm").map(|rd| {
+        rd.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with("card") && !name.contains('-')
+        })
+    });
+    match has_display {
+        Ok(true) => "display-only - no compute capability".into(),
+        _ => "none".into(),
+    }
+}
+
+/// Kernel release without the packaging tags: the part after `+` is the
+/// distro's local build, and a vendor suffix can name the board.
+fn kernel_release() -> String {
+    let raw = read_first(Path::new("/proc/sys/kernel/osrelease"))
+        .unwrap_or_else(|| "unknown".into());
+    if raw == "unknown" {
+        return raw;
+    }
+    let version = raw.split('+').next().unwrap_or("").trim();
+    let clean: Vec<&str> = version.split('-').filter(|s| !names_host(s)).collect();
+    if clean.is_empty() {
+        "unknown".into()
     } else {
-        format!(
-            "display-only ({}) - no compute capability",
-            found.join(", ")
-        )
+        clean.join("-")
     }
 }
 
@@ -148,7 +172,7 @@ impl DeviceProfile {
         Self {
             arch: arch.clone(),
             hostname: read_first(Path::new("/proc/sys/kernel/hostname")).unwrap_or_else(|| "unknown".into()),
-            kernel: read_first(Path::new("/proc/sys/kernel/osrelease")).unwrap_or_else(|| "unknown".into()),
+            kernel: kernel_release(),
             os_pretty: os_pretty(),
             libc: libc_version(),
             cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
@@ -241,6 +265,33 @@ mod tests {
         p.mem.available_bytes = 6 * 1024 * 1024 * 1024;
         let c = p.recommended_concurrency(192 * 1024 * 1024);
         assert!((1..=4).contains(&c), "got {c}");
+    }
+
+    #[test]
+    fn the_profile_never_names_the_board() {
+        let p = DeviceProfile::detect(Path::new("/"));
+        let hay = format!(
+            "{} {} {} {}",
+            p.cpu_model,
+            p.kernel,
+            p.gpu,
+            p.inference_summary()
+        )
+        .to_ascii_lowercase();
+        for tok in [
+            "raspberry",
+            "raspberrypi",
+            "raspi",
+            "rpi",
+            "bcm",
+            "broadcom",
+            "videocore",
+            "video core",
+            "axi/",
+        ] {
+            assert!(!hay.contains(tok), "`{tok}` leaked into: {hay}");
+        }
+        assert!(!p.kernel.contains('+'), "packaging tag kept: {}", p.kernel);
     }
 
     #[test]

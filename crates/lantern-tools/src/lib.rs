@@ -7,9 +7,11 @@
 
 pub mod ctx;
 pub mod exec;
+pub mod memory;
 pub mod registry;
 pub mod tools;
 
 pub use ctx::ToolCtx;
 pub use exec::{ExecOutcome, ExecRequest};
+pub use memory::Memory;
 pub use registry::{Registry, Tool, ToolOutput};

@@ -23,10 +23,16 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     let fs = retention::check_floor(config).ok();
 
     println!("lantern doctor\n");
-    println!(
-        "  device    : {} ({} cores, {})",
-        device.cpu_model, device.cores, device.arch
-    );
+    if device.cpu_model.is_empty() {
+        // The only model string the kernel exposes names the board, so it is
+        // withheld: report the machine itself instead.
+        println!("  device    : {} cores, {}", device.cores, device.arch);
+    } else {
+        println!(
+            "  device    : {} ({} cores, {})",
+            device.cpu_model, device.cores, device.arch
+        );
+    }
     println!(
         "  host      : {} / {} / kernel {}",
         device.hostname, device.os_pretty, device.kernel

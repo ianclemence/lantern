@@ -86,6 +86,8 @@ impl Registry {
             Arc::new(crate::tools::whois::Whois),
             Arc::new(crate::tools::dirb::DirBrute),
             Arc::new(crate::tools::search::WebSearch),
+            Arc::new(crate::tools::knowledge::MemorySearch),
+            Arc::new(crate::tools::knowledge::MemoryStore),
         ];
         tools.sort_by_key(|t| t.name());
 
@@ -206,7 +208,17 @@ mod tests {
     #[test]
     fn native_tools_are_always_registered_and_typed() {
         let (reg, _ctx) = make(false, "");
-        for name in ["port_scan", "dns_lookup", "http_probe", "tls_inspect", "whois", "dir_bruteforce", "web_search"] {
+        for name in [
+            "port_scan",
+            "dns_lookup",
+            "http_probe",
+            "tls_inspect",
+            "whois",
+            "dir_bruteforce",
+            "web_search",
+            "memory_search",
+            "memory_store",
+        ] {
             let t = reg.get(name).unwrap_or_else(|| panic!("missing {name}"));
             assert!(!t.name().is_empty());
             assert!(!t.description().is_empty());
@@ -214,7 +226,7 @@ mod tests {
         }
         // Sorted, deduped, model-facing defs exist.
         let defs = reg.defs();
-        assert!(defs.len() >= 7);
+        assert!(defs.len() >= 9);
         let mut names: Vec<_> = defs.iter().map(|d| d.name.clone()).collect();
         names.sort();
         let before = names.clone();

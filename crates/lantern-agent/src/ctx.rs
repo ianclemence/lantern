@@ -1,8 +1,8 @@
 //! Everything a flow needs, wired once: config, storage, budget, scope, tool
 //! registry, model provider, embeddings and the optional judgement client.
 
-use crate::memory::Memory;
 use anyhow::Context as _;
+use lantern_tools::memory::Memory;
 use lantern_core::budget::Budget;
 use lantern_core::config::{Config, EmbedMode};
 use lantern_core::scope::Scope;

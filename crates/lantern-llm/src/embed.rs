@@ -137,6 +137,20 @@ impl Embedder for OllamaEmbedder {
     }
 }
 
+/// The embedder the configuration asks for: local Ollama when it is enabled,
+/// the explicit "nothing available" state otherwise. Synchronous and cheap -
+/// the client only talks to the network when it is actually used.
+pub fn embedder_from(cfg: &lantern_core::config::EmbedConfig) -> std::sync::Arc<dyn Embedder> {
+    match cfg.mode {
+        lantern_core::config::EmbedMode::Ollama => std::sync::Arc::new(OllamaEmbedder::new(
+            &cfg.url,
+            &cfg.model,
+            cfg.dims,
+        )),
+        lantern_core::config::EmbedMode::Disabled => std::sync::Arc::new(NoEmbedder),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

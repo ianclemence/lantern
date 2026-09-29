@@ -10,6 +10,7 @@ use lantern_core::scope::Scope;
 use lantern_core::storage::models::CommandRow;
 use lantern_core::storage::Db;
 use lantern_core::timeutil;
+use lantern_llm::embed::{embedder_from, Embedder};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ pub struct ToolCtx {
     pub workdir: PathBuf,
     pub offensive: bool,
     pub http: reqwest::Client,
+    pub embedder: Arc<dyn Embedder>,
 }
 
 impl ToolCtx {
@@ -49,6 +51,8 @@ impl ToolCtx {
             .build()
             .context("building http client")?;
 
+        let embedder = embedder_from(&config.embed);
+
         Ok(Self {
             config,
             db,
@@ -58,7 +62,19 @@ impl ToolCtx {
             workdir,
             offensive,
             http,
+            embedder,
         })
+    }
+
+    /// Cross-role memory for the flow this context belongs to. The namespace is
+    /// the normalized scope string, which is exactly what the runtime uses, so
+    /// anything a tool stores lands where role prompts read it back.
+    pub fn memory(&self) -> crate::memory::Memory {
+        crate::memory::Memory::new(
+            self.db.clone(),
+            self.scope.render(),
+            self.embedder.clone(),
+        )
     }
 
     /// Refuse any target outside the flow's declared scope.

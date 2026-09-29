@@ -86,4 +86,5 @@ incremental = false
 
 [profile.dev]
 opt-level = 0
-debug = 1
+debug = false
+incremental = false

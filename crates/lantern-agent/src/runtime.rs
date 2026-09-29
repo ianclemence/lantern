@@ -9,7 +9,6 @@
 
 use crate::ctx::AgentCtx;
 use crate::findings;
-use crate::memory::Memory;
 use crate::prompts;
 use crate::report;
 use crate::roles::{role, RoleId};
@@ -18,6 +17,7 @@ use lantern_llm::jev::Question;
 use lantern_llm::provider::{ChatRequest, Message};
 use lantern_llm::ContextWindow;
 use lantern_tools::ctx::ToolCtx;
+use lantern_tools::memory::Memory;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
