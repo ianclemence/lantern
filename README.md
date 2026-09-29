@@ -70,7 +70,10 @@ actually sees.
 
 ```sh
 make            # release build + on-disk and runtime footprint
-make test       # 141 tests, no API spend (scripted provider)
+make test       # 166 tests, no API spend (scripted provider)
+
+# then this shell can just type `lantern` anywhere
+export PATH="$HOME/lantern/target/release:$PATH"
 ```
 
 Requires a Rust toolchain (1.85+) and OpenSSL development headers. TLS uses
@@ -84,13 +87,13 @@ The release profile is tuned for this device: `lto = "thin"`,
 
 ```sh
 lantern setup                                  # provision every host tool (once per machine)
-lantern setup --with-metasploit                # ...plus the exploit framework (~754 MB)
 lantern doctor                                  # device, budget, integrations, tools
 lantern run --target example.com \
-            --scope "example.com, 93.184.216.0/24"   # full pipeline (read-only)
+            --scope "example.com, 104.20.23.154/32, 172.66.147.243/32"   # full pipeline (read-only), scope covers what it resolves to
 lantern run --target 10.10.5.4 --scope 10.10.5.0/24 \
             --offensive                         # ...and now the gated tools may run
-lantern run --target 127.0.0.1 --scope 127.0.0.1 --dry-run   # scripted, free
+lantern run --dry-run --target example.com \
+            --scope "example.com"               # free: same pipeline, zero model calls
 lantern run ... --roles researcher,pentester    # pick the roles
 lantern run ... --interactive                   # ...and let a role ask you a question
 lantern flows                                   # what has been run
@@ -107,9 +110,7 @@ seen Lantern it detects what is missing and provisions it, and on a machine
 that is already provisioned it reports everything present and changes nothing.
 
 ```sh
-lantern setup                  # apt tools + john + nuclei + template set
-lantern setup --with-metasploit # ...also add the exploit framework
-lantern setup --yes             # never prompt (for scripts)
+lantern setup      # everything the pipeline drives, in one pass
 ```
 
 What it does, in order:
@@ -126,9 +127,10 @@ What it does, in order:
    unpacked into the tools directory.
 4. **template set** - a sparse clone of the CVE templates (4,348 files, 33 MB)
    rather than the whole repository.
-5. **exploit framework** - opt-in, ~754 MB: signing key, signed repository,
-   package install. It asks before it starts unless `--with-metasploit` or
-   `--yes` was given.
+5. **exploit framework** - the ~754 MB signing key, signed repository and
+   package install, downloaded on a first setup like everything else. Without
+   `sudo`, without `apt`, or on an architecture it publishes no packages for,
+   it says so and moves on - it never stops to ask.
 
 Everything runs through the same executor the agent uses - argv arrays, no
 shell, rlimits, timeouts, one audit row per command - and lands either in your

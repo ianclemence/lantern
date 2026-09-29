@@ -14,7 +14,7 @@ use lantern_core::scope::Scope;
 use lantern_core::storage::Db;
 use lantern_tools::ctx::ToolCtx;
 use lantern_tools::exec::{self, ExecRequest};
-use std::io::{IsTerminal, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,14 +41,6 @@ const MSF_KEY_URL: &str = "https://apt.metasploit.com/metasploit-framework.gpg.k
 const MSF_RING: &str = "/usr/share/keyrings/metasploit-framework.gpg";
 const MSF_SOURCES_PATH: &str = "/etc/apt/sources.list.d/metasploit-framework.sources";
 
-#[derive(Debug, Clone, Copy)]
-pub struct Opts {
-    /// Provision the exploit framework too (asks first unless `yes`).
-    pub with_metasploit: bool,
-    /// Never prompt: take the defaults (and answer `no` for optional extras).
-    pub yes: bool,
-}
-
 fn ok(msg: &str) {
     println!("  [ok]      {msg}");
 }
@@ -62,7 +54,7 @@ fn warn(msg: &str) {
     println!("  [warn]    {msg}");
 }
 
-pub async fn run(config: Config, opts: Opts) -> anyhow::Result<()> {
+pub async fn run(config: Config) -> anyhow::Result<()> {
     let tools_dir = config.tools_dir.clone();
     let user_allowlist = config.allowlist.clone();
     let templates = config.nuclei_templates.clone();
@@ -215,25 +207,13 @@ pub async fn run(config: Config, opts: Opts) -> anyhow::Result<()> {
         ));
     }
 
-    // 6. exploit framework (optional, large) -------------------------------------
-    let want_msf = if resolve(&config, "msfconsole").is_ok() {
-        true
-    } else if opts.with_metasploit {
-        true
-    } else if opts.yes || config.offline {
-        false
-    } else if std::io::stdout().is_terminal() {
-        ask_yn("install metasploit-framework (~754 MB download)? [y/N] ")
-    } else {
-        false
-    };
+    // 6. exploit framework ---------------------------------------------------------
     if resolve(&config, "msfconsole").is_ok() {
         ok("msfconsole");
-    } else if !want_msf {
-        skipped("msfconsole: not requested (re-run with --with-metasploit)");
     } else if config.offline {
         skipped("msfconsole: offline mode, not installed");
     } else {
+        installing("metasploit-framework (signing key, signed repository, ~754 MB)");
         install_metasploit(&mut ctx, &config, sudo, apt).await?;
     }
 
@@ -256,6 +236,22 @@ pub async fn run(config: Config, opts: Opts) -> anyhow::Result<()> {
             "\n  still missing: {} - see the warnings above, then re-run `lantern setup`.",
             missing.join(", ")
         );
+    }
+
+    // The binary is usually still sitting in the build directory: hand over the
+    // PATH line rather than making the operator type the full path forever.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let on_path = std::env::var_os("PATH")
+                .map(|p| std::env::split_paths(&p).any(|d| d == dir))
+                .unwrap_or(false);
+            if !on_path {
+                println!(
+                    "\n  put it on PATH: export PATH=\"{}:$PATH\"",
+                    dir.display()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -292,17 +288,6 @@ fn build_package_missing(pkg: &str) -> bool {
         "zlib1g-dev" => !Path::new("/usr/include/zlib.h").exists(),
         _ => false,
     }
-}
-
-fn ask_yn(question: &str) -> bool {
-    use std::io::Write as _;
-    print!("{question}");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 // --- command plumbing ---------------------------------------------------------
@@ -701,6 +686,25 @@ mod tests {
             "lantern-{prefix}-{}-{thread}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn setup_takes_no_optional_tool_switches() {
+        use clap::Parser as _;
+        // One command provisions everything: there is nothing to opt into and
+        // nothing to confirm on the way in.
+        assert!(crate::Cli::try_parse_from(["lantern", "setup"]).is_ok());
+        for argv in [
+            ["setup", "--with-metasploit"].as_slice(),
+            ["setup", "--yes"].as_slice(),
+        ] {
+            let mut full = vec!["lantern"];
+            full.extend_from_slice(argv);
+            match crate::Cli::try_parse_from(full) {
+                Ok(_) => panic!("{} was accepted - optional additions are back", argv[1]),
+                Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument),
+            }
+        }
     }
 
     #[test]

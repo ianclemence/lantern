@@ -38,14 +38,7 @@ enum Cmd {
     /// Verify the device, the storage budget and every integration
     Doctor,
     /// Provision every host tool this build expects (no manual installs)
-    Setup {
-        /// Also install the exploit framework (~754 MB, needs sudo)
-        #[arg(long)]
-        with_metasploit: bool,
-        /// Never prompt: take the defaults
-        #[arg(short = 'y', long)]
-        yes: bool,
-    },
+    Setup,
     /// Run an assessment flow against an in-scope target
     Run {
         /// Target host, IP or URL
@@ -144,16 +137,7 @@ async fn real_main() -> anyhow::Result<()> {
                     )
                     .await?;
                 }
-                Cmd::Setup { with_metasploit, yes } => {
-                    setup::run(
-                        config,
-                        setup::Opts {
-                            with_metasploit,
-                            yes,
-                        },
-                    )
-                    .await?;
-                }
+                Cmd::Setup => setup::run(config).await?,
                 Cmd::Flows { limit } => misc::flows(&config, limit)?,
                 Cmd::Report { flow_id, out } => misc::report(&config, &flow_id, out)?,
                 Cmd::Tools => misc::tools(&config)?,
