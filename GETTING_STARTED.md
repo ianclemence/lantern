@@ -38,7 +38,7 @@ If `cargo` is not on `PATH` yet, prefix with `export PATH="$HOME/.cargo/bin:$PAT
 (or call `~/.cargo/bin/cargo` directly).
 
 That produces `target/release/lantern` - 8,546,696 bytes (8.15 MB), reporting
-`lantern 0.1.2`.
+`lantern 0.1.3`.
 
 ## 2. One command: setup
 
@@ -140,7 +140,8 @@ lantern doctor
 lantern run --dry-run --target example.com --scope "example.com"
 ```
 
-0.29-0.33 s for the full pipeline, a report written, nothing charged.
+0.3-0.5 s for the full pipeline (one cold first run measured 1.6 s), a report
+written, nothing charged.
 
 **Then the real read-only assessment.** `--scope` is the hard boundary, and it
 should cover whatever the target *resolves to*:
