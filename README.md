@@ -70,7 +70,7 @@ actually sees.
 
 ```sh
 make            # release build + on-disk and runtime footprint
-make test       # 198 tests, no API spend (scripted provider)
+make test       # 201 tests, no API spend (scripted provider)
 
 # then any shell can type `lantern`: setup links it into ~/.local/bin
 ./target/release/lantern setup
