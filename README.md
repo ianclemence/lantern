@@ -6,6 +6,10 @@ multi-role agent (planner, researcher, coder, pentester, reflector) drives
 in-process tools and a short allowlist of host binaries, keeps everything it
 learns in SQLite, and writes a deterministic markdown report.
 
+> **New here?** [GETTING_STARTED.md](GETTING_STARTED.md) walks from a fresh
+> clone to a written report - build, setup, the first run, and what the numbers
+> at the end of a run mean.
+
 It is built for one machine class and sized for it: a 4-core aarch64 host with
 8 GiB of RAM and a 30 GB root filesystem.
 
@@ -70,7 +74,7 @@ actually sees.
 
 ```sh
 make            # release build + on-disk and runtime footprint
-make test       # 201 tests, no API spend (scripted provider)
+make test       # 213 tests, no API spend (scripted provider)
 
 # then any shell can type `lantern`: setup links it into ~/.local/bin
 ./target/release/lantern setup
@@ -119,8 +123,11 @@ model list so the menu shows what the account can actually call, reads the key
 with the input hidden and spends one real completion checking that it works -
 a key that cannot talk to the endpoint is not worth storing. The key lands in
 `~/.config/lantern/credentials` at mode `0600`; provider, model and endpoint go
-to `config.json` beside it, which holds no secret. With no terminal attached the
-wizard stands down and says so, so a script never blocks on a prompt.
+to `config.json` beside it, which holds no secret. With no terminal attached
+there is nobody to question, so setup keeps whatever the environment already
+says and stores it after one real check - and when the environment cannot
+finish the job it writes nothing and names the one variable that would, so a
+script never blocks on a prompt.
 
 The tools, then, in order:
 
@@ -251,6 +258,7 @@ order is environment, then file, then preset.
 | `LANTERN_OFFENSIVE` | `0` | same as `--offensive` |
 | `LANTERN_OFFLINE` | `0` | no external calls at all |
 | `LANTERN_TOKEN_BUDGET` | `6000` | context window budget per role |
+| `LANTERN_PRICE_INPUT_PER_MTOK` / `LANTERN_PRICE_OUTPUT_PER_MTOK` | - | USD per million tokens, so a run can print what it cost |
 | `LANTERN_ARTIFACT_DAYS` / `LANTERN_TRACE_DAYS` / `LANTERN_LOG_DAYS` | `7` / `14` / `30` | retention |
 | `LANTERN_VACUUM_FREE_PERCENT` | `25` | full `VACUUM` threshold |
 
