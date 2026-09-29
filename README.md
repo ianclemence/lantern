@@ -70,7 +70,7 @@ actually sees.
 
 ```sh
 make            # release build + on-disk and runtime footprint
-make test       # 166 tests, no API spend (scripted provider)
+make test       # 198 tests, no API spend (scripted provider)
 
 # then this shell can just type `lantern` anywhere
 export PATH="$HOME/lantern/target/release:$PATH"
@@ -86,7 +86,7 @@ The release profile is tuned for this device: `lto = "thin"`,
 ## Commands
 
 ```sh
-lantern setup                                  # provision every host tool (once per machine)
+lantern setup                                  # provider, model, key - then every host tool (once per machine)
 lantern doctor                                  # device, budget, integrations, tools
 lantern run --target example.com \
             --scope "example.com, 104.20.23.154/32, 172.66.147.243/32"   # full pipeline (read-only), scope covers what it resolves to
@@ -106,14 +106,23 @@ lantern gc                                      # retention: compress, prune, va
 ## Setup
 
 `lantern setup` is the whole installation story: on a machine that has never
-seen Lantern it detects what is missing and provisions it, and on a machine
-that is already provisioned it reports everything present and changes nothing.
+seen Lantern it asks the three questions only you can answer and provisions
+what is missing; on a machine that is already set up it reports everything
+present and changes nothing.
 
 ```sh
-lantern setup      # everything the pipeline drives, in one pass
+lantern setup      # provider, model, key - then everything the pipeline drives
 ```
 
-What it does, in order:
+The model half comes first. It lists the providers, fetches that endpoint's own
+model list so the menu shows what the account can actually call, reads the key
+with the input hidden and spends one real completion checking that it works -
+a key that cannot talk to the endpoint is not worth storing. The key lands in
+`~/.config/lantern/credentials` at mode `0600`; provider, model and endpoint go
+to `config.json` beside it, which holds no secret. With no terminal attached the
+wizard stands down and says so, so a script never blocks on a prompt.
+
+The tools, then, in order:
 
 1. **distribution packages** - `nmap`, `sqlmap`, `nikto`, `hydra`, `tcpdump`
    and `bubblewrap` (the sandbox the coder's scripts run in) through
@@ -155,7 +164,7 @@ never competes with logs, artifacts and findings for space.
 | researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, web search | `dns_lookup`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
 | coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `code_run` |
 | pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
-| reflector | judges evidence quality and confidence of every finding | `memory_search`, `ask_operator`, `plan_patch` |
+| reflector | reviews the evidence quality and confidence of every finding | `memory_search`, `ask_operator`, `plan_patch` |
 
 \* requires `--offensive`.
 
@@ -204,13 +213,18 @@ the `lantern` binary stays unprivileged.
 
 ## Environment variables
 
-Keys are read from the environment and **never written to disk**.
+Every value has a default, so nothing here is required. Underneath the
+environment sit the two files the wizard writes - `config.json` (provider,
+model, endpoint; no secrets) and `credentials` (the key, mode `0600`) - and the
+order is environment, then file, then preset.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | - | generation key (required unless `--dry-run`) |
-| `LANTERN_LLM_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible endpoint |
-| `LANTERN_LLM_MODEL` | `deepseek-flash` | chat model |
+| `LANTERN_LLM_PROVIDER` | `deepseek` | preset id from [Providers](#providers) |
+| `LANTERN_LLM_API_KEY` | - | generation key for any provider (each preset also names its own) |
+| `LANTERN_LLM_BASE_URL` | preset's | endpoint override |
+| `LANTERN_LLM_MODEL` | preset's | model override |
+| `LANTERN_CONFIG_DIR` | `~/.config/lantern` | where `config.json` and `credentials` live |
 | `LANTERN_LLM_TIMEOUT_SECS` | `90` | per-request timeout |
 | `LANTERN_LLM_MAX_TOKENS` | `2000` | reply cap |
 | `OLLAMA_URL` / `OLLAMA_EMBED_MODEL` | `http://127.0.0.1:11434` / `nomic-embed-text` | local embeddings |
@@ -233,6 +247,29 @@ Keys are read from the environment and **never written to disk**.
 | `LANTERN_TOKEN_BUDGET` | `6000` | context window budget per role |
 | `LANTERN_ARTIFACT_DAYS` / `LANTERN_TRACE_DAYS` / `LANTERN_LOG_DAYS` | `7` / `14` / `30` | retention |
 | `LANTERN_VACUUM_FREE_PERCENT` | `25` | full `VACUUM` threshold |
+
+### Providers
+
+Nine presets and one escape hatch. The wizard shows the endpoint's own model
+list when it will answer, and falls back to each preset's shortlist - whose
+first entry is the last column below.
+
+| id | endpoint | key variable | default model |
+|---|---|---|---|
+| `deepseek` | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` | `deepseek-flash` |
+| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `gpt-4o-mini` |
+| `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5` |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | `gemini-2.5-flash` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `deepseek/deepseek-chat` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
+| `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `mistral-small-latest` |
+| `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` | `grok-4` |
+| `ollama` | `http://127.0.0.1:11434/v1` | none (local) | first model it lists |
+| `custom` | your own URL | `LANTERN_LLM_API_KEY` (optional) | you name it |
+
+One chat client drives all of them; the preset decides which wire shape to
+speak, since `anthropic` takes the Messages API rather than chat completions.
+A key saved for one provider is never sent to another.
 
 ## Data root
 
@@ -276,9 +313,9 @@ read by every flow after it.
 
 ```
 lantern-cli     CLI: setup / doctor / run / flows / report / tools / gc
-lantern-agent   roles, prompts, tool loop, judgement, reports
+lantern-agent   roles, prompts, tool loop, review, reports
 lantern-tools   native tools, cross-role memory, sandboxed host exec, tool registry (one choke point)
-lantern-llm     OpenAI-compatible client, judgement client, embeddings, context window
+lantern-llm     chat clients (OpenAI-compatible, Anthropic), embeddings, context window
 lantern-core    config, device profiling, storage (SQLite), budget, scope, logging, retention
 ```
 

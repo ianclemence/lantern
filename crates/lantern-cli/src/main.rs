@@ -2,8 +2,10 @@
 
 mod doctor;
 mod misc;
+mod prefs;
 mod run;
 mod setup;
+mod wizard;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -101,6 +103,8 @@ async fn real_main() -> anyhow::Result<()> {
     }
 
     let mut config = Config::load().context("loading configuration")?;
+    // Layer the wizard's preferences and credentials over the environment.
+    prefs::apply(&mut config);
     config.init_dirs().context("creating the data root")?;
     // Keeps the guard alive for the whole run: stderr + size-capped file log.
     let _log = lantern_core::logging::init(&config).context("initialising logging")?;

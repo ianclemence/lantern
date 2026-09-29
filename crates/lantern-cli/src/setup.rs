@@ -41,16 +41,16 @@ const MSF_KEY_URL: &str = "https://apt.metasploit.com/metasploit-framework.gpg.k
 const MSF_RING: &str = "/usr/share/keyrings/metasploit-framework.gpg";
 const MSF_SOURCES_PATH: &str = "/etc/apt/sources.list.d/metasploit-framework.sources";
 
-fn ok(msg: &str) {
+pub(crate) fn ok(msg: &str) {
     println!("  [ok]      {msg}");
 }
-fn installing(msg: &str) {
+pub(crate) fn installing(msg: &str) {
     println!("  [install] {msg}");
 }
-fn skipped(msg: &str) {
+pub(crate) fn skipped(msg: &str) {
     println!("  [skip]    {msg}");
 }
-fn warn(msg: &str) {
+pub(crate) fn warn(msg: &str) {
     println!("  [warn]    {msg}");
 }
 
@@ -83,6 +83,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         println!("  mode      : offline - network steps are skipped");
     }
     println!();
+
+    // The model half of the setup comes first: three questions and one API
+    // call, while the provisioning steps below can take minutes. Without a
+    // terminal there is nobody to ask, so the wizard says so and stands down.
+    let wizard = crate::wizard::run(&config).await?;
 
     // Provisioning runs under wider limits than an assessment does: unpacking a
     // package writes gigabytes, a source build needs minutes of CPU.
@@ -229,6 +234,22 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             }
         }
     }
+    // Restate the model half once provisioning is over: by now the wizard's
+    // own lines have scrolled past several minutes of install output.
+    if let Some(out) = &wizard {
+        println!(
+            "\n  model     : {} / {} @ {}{}",
+            out.provider,
+            out.model,
+            out.base_url,
+            if out.key_saved {
+                " - key saved (mode 0600)"
+            } else {
+                ""
+            }
+        );
+    }
+
     if missing.is_empty() {
         println!("\n  every allowlisted tool is ready - run `lantern doctor` to verify.");
     } else {

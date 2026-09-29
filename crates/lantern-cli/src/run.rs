@@ -47,8 +47,12 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
     let budget = Budget::new(config.data_cap_bytes, dir_size(&config.paths.root));
     println!("{}", retention::startup_line(&config, &budget));
     if config.degraded() && !args.dry_run {
+        let key_env = lantern_core::providers::by_id(&config.llm.provider)
+            .and_then(|p| p.key_env)
+            .unwrap_or("LANTERN_LLM_API_KEY");
         anyhow::bail!(
-            "no generation key: export DEEPSEEK_API_KEY, or pass --dry-run for a scripted run"
+            "no generation key: export {key_env} (or add it with `lantern setup`), \
+             or pass --dry-run for a scripted run"
         );
     }
 

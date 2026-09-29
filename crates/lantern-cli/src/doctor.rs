@@ -68,18 +68,27 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     );
 
     // --- model integrations ------------------------------------------------
-    println!(
-        "  generation: {} @ {} [{}]",
-        config.llm.model,
-        config.llm.base_url,
-        if config.has_llm_key() {
-            "key present"
-        } else if config.offline {
-            "offline mode"
-        } else {
-            "NO KEY (DEEPSEEK_API_KEY)"
-        }
-    );
+    let provider = if config.llm.provider.is_empty() {
+        "none".to_string()
+    } else {
+        config.llm.provider.clone()
+    };
+    let model = if config.llm.model.is_empty() {
+        "NO MODEL".to_string()
+    } else {
+        config.llm.model.clone()
+    };
+    let endpoint = if config.llm.base_url.is_empty() {
+        "NO ENDPOINT".to_string()
+    } else {
+        config.llm.base_url.clone()
+    };
+    let key = if config.offline {
+        "offline mode".to_string()
+    } else {
+        crate::prefs::key_source(config)
+    };
+    println!("  generation: {provider} / {model} @ {endpoint} [{key}]");
 
     let embed_status = if !config.embed.enabled() {
         None
