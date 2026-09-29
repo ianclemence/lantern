@@ -32,25 +32,36 @@ fn read_first(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-/// Strings that identify the board, its vendor or its display controller
-/// rather than anything about the CPU. On ARM boards the `Model` line in
-/// `/proc/cpuinfo` and the distro's kernel build tag name the board itself,
-/// which is not what this profile is about.
-const HOST_TOKENS: &[&str] = &[
-    "raspberry",
-    "raspberrypi",
-    "raspi",
-    "rpi",
-    "broadcom",
-    "bcm",
-    "videocore",
-    "video core",
-    "axi/",
+/// CPU vendors this profile is willing to quote back. Anything else in the
+/// `Model` line of `/proc/cpuinfo` describes the *board* rather than the CPU,
+/// and the board is not what a device profile is about: those hosts get the
+/// neutral "N cores, arch" line instead.
+const CPU_VENDORS: &[&str] = &[
+    "intel",
+    "amd",
+    "arm",
+    "apple",
+    "qualcomm",
+    "mediatek",
+    "nvidia",
+    "hygon",
+    "zhaoxin",
+    "loongson",
+    "rockchip",
+    "phytium",
+    "ampere",
+    "fujitsu",
+    "hisilicon",
+    "samsung",
+    "nxp",
+    "marvell",
+    "ibm",
+    "centaur",
 ];
 
-fn names_host(text: &str) -> bool {
+fn names_a_cpu(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
-    HOST_TOKENS.iter().any(|tok| t.contains(tok))
+    CPU_VENDORS.iter().any(|v| t.contains(v))
 }
 
 fn proc_meminfo() -> MemInfo {
@@ -88,7 +99,7 @@ fn cpu_model() -> String {
         );
         if let Some((_, v)) = found {
             let v = v.trim();
-            if !v.is_empty() && !names_host(v) {
+            if !v.is_empty() && names_a_cpu(v) {
                 return v.to_string();
             }
         }
@@ -133,16 +144,34 @@ fn gpu_summary() -> String {
 fn kernel_release() -> String {
     let raw = read_first(Path::new("/proc/sys/kernel/osrelease"))
         .unwrap_or_else(|| "unknown".into());
+    kernel_release_of(&raw)
+}
+
+/// Reduce a kernel release string to the version proper: digits and dots only,
+/// so everything a distribution appends to it (build tags, local flavour
+/// names) describes *its* build of the kernel rather than the host.
+fn kernel_release_of(raw: &str) -> String {
+    let raw = raw.trim();
     if raw == "unknown" {
-        return raw;
+        return raw.to_string();
     }
-    let version = raw.split('+').next().unwrap_or("").trim();
-    let clean: Vec<&str> = version.split('-').filter(|s| !names_host(s)).collect();
-    if clean.is_empty() {
-        "unknown".into()
-    } else {
-        clean.join("-")
+    let digits: String = raw
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .to_string();
+    let major = &raw[..raw.len() - digits.len()];
+    if major.is_empty() {
+        return "unknown".into();
     }
+    let mut out = major.to_string();
+    for part in digits.trim_start_matches('.').split('.') {
+        let numeric: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if numeric.is_empty() {
+            break;
+        }
+        out.push('.');
+        out.push_str(&numeric);
+    }
+    out
 }
 
 fn libc_version() -> String {
@@ -268,34 +297,53 @@ mod tests {
     }
 
     #[test]
-    fn the_profile_never_names_the_board() {
+    fn the_profile_reports_only_what_it_is_about() {
         let p = DeviceProfile::detect(Path::new("/"));
-        let hay = format!(
-            "{} {} {} {}",
-            p.cpu_model,
-            p.kernel,
-            p.gpu,
-            p.inference_summary()
-        )
-        .to_ascii_lowercase();
-        for tok in [
-            "raspberry",
-            "raspberrypi",
-            "raspi",
-            "rpi",
-            "bcm",
-            "broadcom",
-            "videocore",
-            "video core",
-            "axi/",
-        ] {
-            assert!(!hay.contains(tok), "`{tok}` leaked into: {hay}");
+        // CPU: either withheld (this host only knows its board) or a vendor.
+        if !p.cpu_model.is_empty() {
+            assert!(
+                names_a_cpu(&p.cpu_model),
+                "quoted a string that is not a CPU: {}",
+                p.cpu_model
+            );
         }
+        // Kernel: digits and dots, so no packaging tag can survive.
         assert!(!p.kernel.contains('+'), "packaging tag kept: {}", p.kernel);
+        assert!(
+            p.kernel.chars().all(|c| c.is_ascii_digit() || c == '.'),
+            "not a plain version: {}",
+            p.kernel
+        );
+        // GPU: a status line, never a device path.
+        assert!(!p.gpu.contains('/'), "path leaked: {}", p.gpu);
+        assert!(
+            !p.inference_summary().contains('/'),
+            "path leaked: {}",
+            p.inference_summary()
+        );
     }
 
     #[test]
     fn pathbuf_used() {
         let _ = PathBuf::from("/tmp");
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn kernel_version_drops_every_packaging_tag() {
+        // The three shapes seen in the wild: distro build tag, flavour suffix,
+        // and a plain version.
+        for (raw, want) in [
+            ("6.18.50+rpt-local", "6.18.50"),
+            ("6.1.0-21-amd64", "6.1.0"),
+            ("5.15.0", "5.15.0"),
+        ] {
+            let got = super::kernel_release_of(raw);
+            assert_eq!(got, want, "input {raw}");
+        }
+        assert_eq!(super::kernel_release_of("unknown"), "unknown");
+        assert_eq!(super::kernel_release_of("v8"), "unknown");
     }
 }

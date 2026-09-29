@@ -16,10 +16,11 @@ use std::sync::Arc;
 /// Namespace for knowledge that outlives an engagement (guides, playbooks).
 pub const GLOBAL_SCOPE: &str = "global";
 
-/// Character budget for a note. Memory is read back into the prompt.
-const NOTE_CHARS: usize = 300;
-/// Guides carry a little more: they are replayed on every flow.
-const GUIDE_CHARS: usize = 500;
+/// Clip budget for a note: `text_clip` keeps up to this many units of it, and
+/// memory is read straight back into the prompt.
+const NOTE_BUDGET: usize = 300;
+/// Guides carry a little more room: they are replayed on every flow.
+const GUIDE_BUDGET: usize = 500;
 
 pub struct Memory {
     db: Arc<Db>,
@@ -51,12 +52,12 @@ impl Memory {
     /// Store one observation in this engagement's namespace.
     /// Returns `None` when nothing was written.
     pub async fn remember(&self, kind: &str, text: &str) -> Option<i64> {
-        self.store(&self.scope_key, kind, text, NOTE_CHARS).await
+        self.store(&self.scope_key, kind, text, NOTE_BUDGET).await
     }
 
     /// Store a note in the shared namespace: every later flow can read it.
     pub async fn remember_global(&self, kind: &str, text: &str) -> Option<i64> {
-        self.store(GLOBAL_SCOPE, kind, text, GUIDE_CHARS).await
+        self.store(GLOBAL_SCOPE, kind, text, GUIDE_BUDGET).await
     }
 
     /// Keyword recall over this engagement's namespace plus the shared guides.
@@ -122,9 +123,9 @@ impl Memory {
         scope_key: &str,
         kind: &str,
         text: &str,
-        max_chars: usize,
+        budget: usize,
     ) -> Option<i64> {
-        let text = lantern_core::text_clip(text.trim(), max_chars);
+        let text = lantern_core::text_clip(text.trim(), budget);
         if text.is_empty() {
             return None;
         }
