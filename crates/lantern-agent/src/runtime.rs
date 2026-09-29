@@ -33,6 +33,9 @@ pub struct FlowOptions {
     pub max_steps: Option<usize>,
     /// Roles may stop and ask the operator a question (`ask_operator`).
     pub interactive: bool,
+    /// The operator's own instruction, verbatim (`lantern ask`). Stored with
+    /// the flow as an artifact; each role sees the condensed head of it.
+    pub directive: Option<String>,
 }
 
 impl FlowOptions {
@@ -44,6 +47,7 @@ impl FlowOptions {
             roles: Vec::new(),
             max_steps: None,
             interactive: false,
+            directive: None,
         }
     }
 
@@ -128,6 +132,7 @@ pub async fn run_flow(agent: &AgentCtx, opts: FlowOptions) -> anyhow::Result<Flo
             "offensive": opts.offensive,
             "roles": order.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
             "dry_run": agent.dry_run,
+            "directive_chars": opts.directive.as_ref().map(|d| d.chars().count()).unwrap_or(0),
         }),
     )?;
     agent.db.set_flow_status(&flow_id, "running")?;
@@ -200,7 +205,19 @@ async fn run_inner(
     }
 
     // --- plan -------------------------------------------------------------
-    let plan = match plan_phase(agent, target, scope).await {
+    // The operator's words are stored verbatim as an artifact and travel
+    // condensed into every objective: the model acts on the instruction, but
+    // the 6,000-token working set cannot carry a whole framework per call.
+    let directive_brief = opts
+        .directive
+        .as_deref()
+        .map(|d| crate::intent::condense_directive(d, crate::intent::DIRECTIVE_CHARS));
+    if let Some(full) = &opts.directive {
+        if let Err(e) = tool_ctx.write_artifact("directive.md", full.as_bytes()) {
+            warnings.push(format!("directive not stored: {e:#}"));
+        }
+    }
+    let plan = match plan_phase(agent, target, scope, opts.directive.as_deref()).await {
         Ok(p) => p,
         Err(e) => {
             warnings.push(format!("planning failed, using the default plan: {e:#}"));
@@ -241,8 +258,11 @@ async fn run_inner(
             _ => {
                 let recalled = memory.recall(target, 5);
                 let plan_now = tool_ctx.plan_text();
-                let objective =
+                let mut objective =
                     prompts::role_objective(*id, target, &plan_now, &Memory::render(&recalled));
+                if let Some(brief) = &directive_brief {
+                    objective = format!("OPERATOR DIRECTIVE:\n{brief}\n\n{objective}");
+                }
                 run_role(
                     agent,
                     flow_id,
@@ -328,12 +348,25 @@ async fn run_inner(
     })
 }
 
-async fn plan_phase(agent: &AgentCtx, target: &str, scope: &str) -> anyhow::Result<String> {
+async fn plan_phase(
+    agent: &AgentCtx,
+    target: &str,
+    scope: &str,
+    directive: Option<&str>,
+) -> anyhow::Result<String> {
     if agent.dry_run {
         return Ok(default_plan(target));
     }
+    let mut prompt = prompts::plan_objective(target, scope);
+    if let Some(d) = directive {
+        prompt.push_str("\n\nOPERATOR DIRECTIVE:\n");
+        prompt.push_str(&crate::intent::condense_directive(
+            d,
+            crate::intent::DIRECTIVE_CHARS,
+        ));
+    }
     let text = agent
-        .complete(&prompts::plan_objective(target, scope), 500)
+        .complete(&prompt, 500)
         .await
         .context("orchestrator call")?;
     let text = text.trim().to_string();
@@ -750,7 +783,30 @@ mod tests {
     #[tokio::test]
     async fn default_plan_is_used_in_dry_run() {
         let agent = scripted(vec![]);
-        let p = plan_phase(&agent, "127.0.0.1", "127.0.0.1").await.unwrap();
+        let p = plan_phase(&agent, "127.0.0.1", "127.0.0.1", None)
+            .await
+            .unwrap();
         assert!(p.contains("Resolve DNS"));
+    }
+
+    #[tokio::test]
+    async fn a_directive_is_stored_and_names_the_flow_options() {
+        let agent = scripted(vec![findings_reply()]);
+        let mut opts = FlowOptions::new("127.0.0.1", "127.0.0.1, localhost")
+            .roles(vec![RoleId::Researcher]);
+        opts.directive = Some("MISSION: check TLS\nTARGETS: 127.0.0.1".into());
+        let out = run_flow(&agent, opts).await.expect("flow runs");
+
+        let artifact = agent
+            .config
+            .paths
+            .artifacts()
+            .join(&out.flow_id)
+            .join("directive.md");
+        let stored = std::fs::read_to_string(&artifact).expect("directive artifact");
+        assert!(stored.contains("MISSION: check TLS"), "{stored}");
+
+        let flow = agent.db.get_flow(&out.flow_id).unwrap().unwrap();
+        assert_eq!(flow.options["directive_chars"].as_u64().unwrap(), 37);
     }
 }

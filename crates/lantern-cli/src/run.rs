@@ -1,6 +1,6 @@
 //! `lantern run` - the assessment flow.
 
-use lantern_agent::{run_flow, AgentCtx, FlowOptions, Footprint, RoleId};
+use lantern_agent::{run_flow, AgentCtx, FlowOptions, FlowOutcome, Footprint, RoleId};
 use lantern_core::budget::{dir_size, Budget};
 use lantern_core::config::Config;
 use lantern_core::retention;
@@ -15,7 +15,7 @@ pub struct Args {
     pub interactive: bool,
 }
 
-fn parse_roles(spec: Option<&str>) -> anyhow::Result<Vec<RoleId>> {
+pub(crate) fn parse_roles(spec: Option<&str>) -> anyhow::Result<Vec<RoleId>> {
     let Some(spec) = spec else {
         return Ok(Vec::new()); // default pipeline
     };
@@ -78,7 +78,11 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
     }
 
     let out = run_flow(&agent, opts).await?;
+    print_outcome(&agent, &out)
+}
 
+/// Shared outcome block: `run` and `ask` report a finished flow identically.
+pub(crate) fn print_outcome(agent: &AgentCtx, out: &FlowOutcome) -> anyhow::Result<()> {
     // --- outcome -----------------------------------------------------------
     let status = agent
         .db
@@ -118,7 +122,7 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn one_line(text: &str, max: usize) -> String {
+pub(crate) fn one_line(text: &str, max: usize) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
         flat

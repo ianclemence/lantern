@@ -31,7 +31,7 @@ sudo apt install build-essential libssl-dev pkg-config
 git clone https://github.com/ianclemence/lantern.git
 cd lantern
 make          # release build, then on-disk and runtime footprint
-make test     # 213 tests, no API spend (scripted provider)
+make test     # 227 tests, no API spend (scripted provider)
 ```
 
 If `cargo` is not on `PATH` yet, prefix with `export PATH="$HOME/.cargo/bin:$PATH"`
@@ -172,7 +172,20 @@ lantern run ... --roles researcher,pentester   # subset of the pipeline
 lantern run ... --steps 4                      # cap model steps per role
 lantern run ... --interactive                  # roles may stop and ask you
 LANTERN_OPERATOR_ANSWER="yes" lantern run ...  # ...answered unattended instead
+lantern ask --target example.com --scope "example.com" \
+            --prompt "Check TLS and headers, defensive only"   # words, not flags
+lantern ask --target shop.example.com --scope "shop.example.com" \
+            --file framework.md --dry-run                      # a whole framework, free to preview
 ```
+
+`ask` takes the same `--target`, `--scope`, `--roles`, `--steps` and
+`--offensive` as `run`, plus one instruction: `--prompt`, `--file`, or piped
+stdin. The full text is stored with the flow and each role sees its head, so a
+35-section framework fits the 6,000-token working set. Before anything runs, an
+intent card says what was understood - and the safety rule is that the prompt
+can only restrain `--offensive`, never grant it: ask for exploitation without
+the flag and you get reconnaissance plus the flag named; pass the flag with a
+defensive-only prompt and the prompt wins, loudly in both cases.
 
 ## 5. Reading the results
 

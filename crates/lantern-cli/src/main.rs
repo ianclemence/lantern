@@ -1,5 +1,6 @@
 //! `lantern` - native security assessment from the CLI.
 
+mod ask;
 mod doctor;
 mod misc;
 mod prefs;
@@ -54,6 +55,37 @@ enum Cmd {
         roles: Option<String>,
         /// Enable active testing (sqlmap, hydra, nuclei, msfconsole, john).
         /// Audit-logged and scope-gated.
+        #[arg(long)]
+        offensive: bool,
+        /// Scripted run: no model calls, nothing is spent
+        #[arg(long)]
+        dry_run: bool,
+        /// Cap model steps per role (can only lower a role's own cap)
+        #[arg(long)]
+        steps: Option<usize>,
+        /// Let roles stop and ask you a question before deciding. Without a
+        /// terminal, set LANTERN_OPERATOR_ANSWER to reply unattended.
+        #[arg(long)]
+        interactive: bool,
+    },
+    /// Instruct the assessment in natural language instead of flags
+    Ask {
+        /// The instruction itself. May be a sentence or a whole framework
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Read the instruction from this file instead
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Target host, IP or URL (always the authority, whatever the prompt says)
+        #[arg(long)]
+        target: String,
+        /// Comma-separated hosts, IPs and CIDRs this flow may touch
+        #[arg(long)]
+        scope: String,
+        /// Roles to run, e.g. "researcher,pentester" (default: full pipeline)
+        #[arg(long)]
+        roles: Option<String>,
+        /// Enable active testing. The prompt can restrain this, never grant it
         #[arg(long)]
         offensive: bool,
         /// Scripted run: no model calls, nothing is spent
@@ -130,6 +162,34 @@ async fn real_main() -> anyhow::Result<()> {
                     run::run(
                         config,
                         run::Args {
+                            target,
+                            scope,
+                            roles,
+                            offensive,
+                            dry_run,
+                            steps,
+                            interactive,
+                        },
+                    )
+                    .await?;
+                }
+                Cmd::Ask {
+                    prompt,
+                    file,
+                    target,
+                    scope,
+                    roles,
+                    offensive,
+                    dry_run,
+                    steps,
+                    interactive,
+                } => {
+                    config.offensive = config.offensive || offensive;
+                    ask::run(
+                        config,
+                        ask::Args {
+                            prompt,
+                            file,
                             target,
                             scope,
                             roles,

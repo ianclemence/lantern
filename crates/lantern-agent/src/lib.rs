@@ -7,6 +7,7 @@
 
 pub mod ctx;
 pub mod findings;
+pub mod intent;
 pub mod prompts;
 pub mod provider;
 pub mod report;
