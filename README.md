@@ -149,10 +149,10 @@ never competes with logs, artifacts and findings for space.
 |---|---|---|
 | orchestrator | turns the objective into a written plan | - |
 | planner | reorders the plan by risk and effort | - |
-| researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, web search | `dns_lookup`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator` |
-| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator` |
-| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `memory_search`, `memory_store`, `ask_operator` |
-| reflector | judges evidence quality and confidence of every finding | `memory_search`, `ask_operator` |
+| researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, web search | `dns_lookup`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
+| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
+| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
+| reflector | judges evidence quality and confidence of every finding | `memory_search`, `ask_operator`, `plan_patch` |
 
 \* requires `--offensive`.
 
@@ -167,7 +167,9 @@ In-process (no child process): `port_scan`, `dns_lookup`, `http_probe`,
 `web_search` (DuckDuckGo HTML by default, a search API if you configure one;
 `mode: vulnerability` puts matching NVD CVEs and their CVSS scores first),
 `memory_search`, `memory_store`, `ask_operator` (only under `--interactive`,
-and silent unless you set `LANTERN_OPERATOR_ANSWER`).
+and silent unless you set `LANTERN_OPERATOR_ANSWER`), `plan_patch` (roles
+correct the plan once facts disagree with it, and later roles read the
+corrected version).
 
 Allowlisted host binaries, all provisioned by `lantern setup`:
 

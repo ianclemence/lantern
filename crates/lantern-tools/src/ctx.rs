@@ -24,6 +24,9 @@ pub struct ToolCtx {
     pub offensive: bool,
     /// The operator may be asked a question: `lantern run --interactive`.
     pub interactive: bool,
+    /// The plan as it currently stands. Roles amend it with `plan_patch` and
+    /// later roles are handed the amended version.
+    pub plan: Arc<std::sync::Mutex<Vec<String>>>,
     pub http: reqwest::Client,
     pub embedder: Arc<dyn Embedder>,
 }
@@ -64,9 +67,20 @@ impl ToolCtx {
             workdir,
             offensive,
             interactive: false,
+            plan: Arc::new(std::sync::Mutex::new(Vec::new())),
             http,
             embedder,
         })
+    }
+
+    /// Replace the live plan (the planner's ordering, or a fresh seed).
+    pub fn set_plan(&self, steps: Vec<String>) {
+        *self.plan.lock().unwrap_or_else(|e| e.into_inner()) = steps;
+    }
+
+    /// The live plan as numbered text, ready for a prompt.
+    pub fn plan_text(&self) -> String {
+        crate::tools::plan::render_steps(&self.plan.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Cross-role memory for the flow this context belongs to. The namespace is

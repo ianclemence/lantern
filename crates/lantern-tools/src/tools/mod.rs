@@ -8,6 +8,7 @@ pub mod ask;
 pub mod host;
 pub mod http_probe;
 pub mod knowledge;
+pub mod plan;
 pub mod port_scan;
 pub mod search;
 pub mod tls_inspect;

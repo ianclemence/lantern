@@ -200,6 +200,7 @@ async fn run_inner(
             default_plan(target)
         }
     };
+    tool_ctx.set_plan(lantern_tools::tools::plan::steps_from_plan_text(&plan));
     if !agent.dry_run {
         outcomes.push(RoleOutcome {
             role: RoleId::Orchestrator,
@@ -217,12 +218,24 @@ async fn run_inner(
             continue; // already covered by the plan phase
         }
         let res = match id {
-            RoleId::Planner => planner_phase(agent, flow_id, target, &plan).await,
+            RoleId::Planner => {
+                let ordered = planner_phase(agent, flow_id, target, &tool_ctx.plan_text()).await;
+                if let Ok(o) = &ordered {
+                    // The planner's ordering becomes the live plan, so every
+                    // later role - and every amendment - builds on it.
+                    let steps = lantern_tools::tools::plan::steps_from_plan_text(&o.summary);
+                    if steps.len() >= 2 {
+                        tool_ctx.set_plan(steps);
+                    }
+                }
+                ordered
+            }
             RoleId::Reflector => reflect_phase(agent, flow_id, target, &mut warnings).await,
             _ => {
                 let recalled = memory.recall(target, 5);
+                let plan_now = tool_ctx.plan_text();
                 let objective =
-                    prompts::role_objective(*id, target, &plan, &Memory::render(&recalled));
+                    prompts::role_objective(*id, target, &plan_now, &Memory::render(&recalled));
                 run_role(
                     agent,
                     flow_id,
@@ -278,7 +291,7 @@ async fn run_inner(
 
     Ok(FlowOutcome {
         flow_id: flow_id.to_string(),
-        plan,
+        plan: tool_ctx.plan_text(),
         roles: outcomes,
         findings: findings_count,
         steps,
@@ -684,6 +697,34 @@ mod tests {
         let flow = agent.db.get_flow(&out.flow_id).unwrap().unwrap();
         assert_eq!(flow.status, "completed");
         assert_eq!(flow.target, "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn a_role_can_amend_the_plan_and_the_outcome_shows_it() {
+        let agent = scripted(vec![
+            Scripted::ToolCall {
+                name: "plan_patch".into(),
+                arguments: r#"{"add":"crack the captured hash with host_john"}"#.into(),
+            },
+            findings_reply(),
+        ]);
+        let opts = FlowOptions::new("127.0.0.1", "127.0.0.1, localhost")
+            .roles(vec![RoleId::Researcher]);
+        let out = run_flow(&agent, opts).await.expect("flow runs");
+
+        assert!(
+            out.plan.contains("crack the captured hash with host_john"),
+            "plan: {}",
+            out.plan
+        );
+        // The default plan has five steps: the amendment lands as the sixth,
+        // and the whole list is renumbered rather than appended to blindly.
+        assert!(
+            out.plan.ends_with("6. crack the captured hash with host_john"),
+            "{}",
+            out.plan
+        );
+        assert!(out.plan.starts_with("1. "), "{}", out.plan);
     }
 
     #[tokio::test]
