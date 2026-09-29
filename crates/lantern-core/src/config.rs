@@ -18,14 +18,6 @@ pub struct LlmConfig {
     pub temperature: f32,
 }
 
-#[derive(Debug, Clone)]
-pub struct JevConfig {
-    pub endpoint: String,
-    pub model: String,
-    pub api_key: String,
-    pub timeout_secs: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmbedMode {
     /// Local Ollama model (preferred, free, works offline).
@@ -138,7 +130,6 @@ pub struct Config {
     /// RAM allowance per concurrent task.
     pub ram_per_task_bytes: u64,
     pub llm: LlmConfig,
-    pub jev: JevConfig,
     pub embed: EmbedConfig,
 }
 
@@ -285,23 +276,12 @@ impl Config {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0.2),
             },
-            jev: JevConfig {
-                endpoint: env_str("LANTERN_JEV_URL")
-                    .unwrap_or_else(|| "https://api.typesafe.ai/v1/systemone".into()),
-                model: env_str("LANTERN_JEV_MODEL").unwrap_or_else(|| "jev-latest".into()),
-                api_key: env_str("TYPESAFE_API_KEY").unwrap_or_default(),
-                timeout_secs: env_u64("LANTERN_JEV_TIMEOUT_SECS", 30),
-            },
             embed,
         })
     }
 
     pub fn has_llm_key(&self) -> bool {
         !self.llm.api_key.is_empty()
-    }
-
-    pub fn has_jev_key(&self) -> bool {
-        !self.jev.api_key.is_empty()
     }
 
     /// True when the agent can still operate (tools run, reports render) but no

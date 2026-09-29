@@ -213,8 +213,6 @@ Keys are read from the environment and **never written to disk**.
 | `LANTERN_LLM_MODEL` | `deepseek-flash` | chat model |
 | `LANTERN_LLM_TIMEOUT_SECS` | `90` | per-request timeout |
 | `LANTERN_LLM_MAX_TOKENS` | `2000` | reply cap |
-| `TYPESAFE_API_KEY` | - | structured judgement client (optional) |
-| `LANTERN_JEV_URL` / `LANTERN_JEV_MODEL` | `https://api.typesafe.ai/v1/systemone` / `jev-latest` | judgement endpoint |
 | `OLLAMA_URL` / `OLLAMA_EMBED_MODEL` | `http://127.0.0.1:11434` / `nomic-embed-text` | local embeddings |
 | `LANTERN_EMBED` | `1` | `0` disables embeddings (keyword search only) |
 | `LANTERN_DATA_ROOT` | `~/.local/share/lantern` | single data root |

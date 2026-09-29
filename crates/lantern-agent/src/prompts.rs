@@ -99,11 +99,6 @@ pub fn role_objective(role: RoleId, target: &str, plan: &str, memory: &str) -> S
     s
 }
 
-/// State document handed to the reflector (structured judgement client).
-pub fn reflect_state(target: &str, findings: &str) -> String {
-    format!("target: {target}\nfindings:\n{findings}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

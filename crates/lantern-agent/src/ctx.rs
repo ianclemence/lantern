@@ -1,5 +1,5 @@
 //! Everything a flow needs, wired once: config, storage, budget, scope, tool
-//! registry, model provider, embeddings and the optional judgement client.
+//! registry, model provider and embeddings.
 
 use anyhow::Context as _;
 use lantern_tools::memory::Memory;
@@ -8,7 +8,6 @@ use lantern_core::config::{Config, EmbedMode};
 use lantern_core::scope::Scope;
 use lantern_core::storage::Db;
 use lantern_llm::embed::{Embedder, NoEmbedder, OllamaEmbedder};
-use lantern_llm::jev::JevClient;
 use lantern_llm::mock::MockProvider;
 use lantern_llm::openai_compat::OpenAiCompat;
 use lantern_llm::provider::ChatProvider;
@@ -25,7 +24,6 @@ pub struct AgentCtx {
     pub registry: Registry,
     pub provider: Arc<dyn ChatProvider>,
     pub embedder: Arc<dyn Embedder>,
-    pub jev: Option<JevClient>,
     pub dry_run: bool,
 }
 
@@ -75,20 +73,6 @@ impl AgentCtx {
             EmbedMode::Disabled => Arc::new(NoEmbedder),
         };
 
-        let jev = if config.has_jev_key() {
-            Some(
-                JevClient::new(
-                    &config.jev.endpoint,
-                    &config.jev.model,
-                    &config.jev.api_key,
-                    Duration::from_secs(config.jev.timeout_secs),
-                )
-                .context("building judgement client")?,
-            )
-        } else {
-            None
-        };
-
         Ok(Self {
             config: Arc::new(config),
             db,
@@ -97,7 +81,6 @@ impl AgentCtx {
             registry,
             provider,
             embedder,
-            jev,
             dry_run,
         })
     }

@@ -718,7 +718,7 @@ mod tests {
                     evidence: Some("SSH-2.0-OpenSSH_8.9".into()),
                     remediation: None,
                     confidence: Some(0.8),
-                    judge: Some("jev".into()),
+                    judge: Some("manual review".into()),
                 },
             )
             .unwrap();

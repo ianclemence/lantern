@@ -13,7 +13,6 @@ use crate::prompts;
 use crate::report;
 use crate::roles::{role, RoleId};
 use anyhow::Context as _;
-use lantern_llm::jev::Question;
 use lantern_llm::provider::{ChatRequest, Message};
 use lantern_llm::ContextWindow;
 use lantern_tools::ctx::ToolCtx;
@@ -233,7 +232,7 @@ async fn run_inner(
                 }
                 ordered
             }
-            RoleId::Reflector => reflect_phase(agent, flow_id, target, &mut warnings).await,
+            RoleId::Reflector => reflect_phase(agent, flow_id, &mut warnings).await,
             _ => {
                 let recalled = memory.recall(target, 5);
                 let plan_now = tool_ctx.plan_text();
@@ -519,71 +518,27 @@ async fn role_loop(
     Ok((text, steps))
 }
 
-/// Judge every finding: structured judgement client when configured, otherwise
-/// a plain model review. Never fatal - the report ships either way.
+/// Review every finding for evidence quality and severity accuracy. Never
+/// fatal: the report ships either way.
 async fn reflect_phase(
     agent: &AgentCtx,
     flow_id: &str,
-    target: &str,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<RoleOutcome> {
     let found = agent.db.findings_for_flow(flow_id)?;
     if found.is_empty() {
         return Ok(RoleOutcome {
             role: RoleId::Reflector,
-            summary: "no findings to judge".into(),
+            summary: "no findings to review".into(),
             steps: 0,
             findings: 0,
             error: None,
         });
     }
 
-    let state = prompts::reflect_state(target, &findings_json(&found));
-    let mut judged = 0usize;
-
-    if let Some(jev) = &agent.jev {
-        let mut questions = std::collections::BTreeMap::new();
-        questions.insert(
-            "evidence_quality".to_string(),
-            Question::score(
-                "Rate how strongly the findings are supported by the recorded tool output.",
-                &[
-                    "reproducible",
-                    "evidence quoted",
-                    "in scope",
-                    "severity justified",
-                ],
-            ),
-        );
-        match jev.evaluate(&state, questions).await {
-            Ok(resp) => {
-                let score = resp
-                    .get("evidence_quality")
-                    .and_then(|a| a.as_score())
-                    .map(normalise_score);
-                let label = format!("jev:{}", jev.model());
-                if let Some(s) = score {
-                    for f in &found {
-                        agent.db.judge_finding(f.id, &label, s)?;
-                        judged += 1;
-                    }
-                }
-                agent.db.add_event(
-                    Some(flow_id),
-                    None,
-                    "info",
-                    "reflect",
-                    &format!(
-                        "judged {judged} finding(s) at {:.2} (mean confidence {:.2})",
-                        score.unwrap_or(0.0),
-                        resp.mean_confidence()
-                    ),
-                    None,
-                )?;
-            }
-            Err(e) => warnings.push(format!("judgement service unavailable: {e:#}")),
-        }
-    } else if !agent.dry_run {
+    let mut reviewed = 0usize;
+    // A scripted run makes no model calls, the same as every other phase here.
+    if !agent.dry_run {
         let prompt = format!(
             "Review these findings for evidence quality and severity accuracy. \
              One line each, prefix `NAME:` with a confidence from 0 to 1.\n\n{}",
@@ -597,14 +552,20 @@ async fn reflect_phase(
                     "review",
                     &json!({"review": lantern_core::text_clip(&text, 500)}),
                 )?;
+                reviewed = found.len();
             }
             Err(e) => warnings.push(format!("review skipped: {e:#}")),
         }
     }
 
+    let summary = if reviewed == found.len() {
+        format!("reviewed {reviewed} finding(s)")
+    } else {
+        format!("reviewed {reviewed} of {} finding(s)", found.len())
+    };
     Ok(RoleOutcome {
         role: RoleId::Reflector,
-        summary: format!("judged {judged} of {} finding(s)", found.len()),
+        summary,
         steps: 1,
         findings: found.len(),
         error: None,
@@ -628,12 +589,6 @@ fn findings_json(found: &[lantern_core::storage::models::Finding]) -> String {
         .collect();
     serde_json::to_string_pretty(&serde_json::Value::Array(arr))
         .unwrap_or_else(|_| "[]".into())
-}
-
-/// Judgement scores arrive as 0..1, 0..10 or 0..100 depending on the model.
-fn normalise_score(s: f64) -> f64 {
-    let s = if s > 1.0 { s / 100.0 } else { s };
-    s.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -748,15 +703,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("empty target"), "got: {err}");
-    }
-
-    #[test]
-    fn scores_are_normalised() {
-        assert!((normalise_score(0.8) - 0.8).abs() < 1e-9);
-        assert!((normalise_score(8.0) - 0.08).abs() < 1e-9);
-        assert!((normalise_score(87.0) - 0.87).abs() < 1e-9);
-        assert_eq!(normalise_score(150.0), 1.0);
-        assert_eq!(normalise_score(-3.0), 0.0);
     }
 
     #[tokio::test]

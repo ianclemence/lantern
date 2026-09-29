@@ -80,15 +80,6 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
             "NO KEY (DEEPSEEK_API_KEY)"
         }
     );
-    println!(
-        "  judgement : {} [{}]",
-        config.jev.model,
-        if config.has_jev_key() {
-            "key present"
-        } else {
-            "no key (TYPESAFE_API_KEY) - reflection falls back to the generator"
-        }
-    );
 
     let embed_status = if !config.embed.enabled() {
         None
