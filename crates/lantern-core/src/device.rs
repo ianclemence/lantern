@@ -47,7 +47,6 @@ const CPU_VENDORS: &[&str] = &[
     "hygon",
     "zhaoxin",
     "loongson",
-    "rockchip",
     "phytium",
     "ampere",
     "fujitsu",
