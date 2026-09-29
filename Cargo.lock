@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-agent"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "lantern-core",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-llm"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "lantern-core",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-tools"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "flate2",
