@@ -90,6 +90,7 @@ impl Registry {
             Arc::new(crate::tools::knowledge::MemoryStore),
             Arc::new(crate::tools::ask::AskOperator),
             Arc::new(crate::tools::plan::PlanPatch),
+            Arc::new(crate::tools::code::CodeRun),
         ];
         tools.sort_by_key(|t| t.name());
 
@@ -222,6 +223,7 @@ mod tests {
             "memory_store",
             "ask_operator",
             "plan_patch",
+            "code_run",
         ] {
             let t = reg.get(name).unwrap_or_else(|| panic!("missing {name}"));
             assert!(!t.name().is_empty());

@@ -115,7 +115,8 @@ lantern setup --yes             # never prompt (for scripts)
 What it does, in order:
 
 1. **distribution packages** - `nmap`, `sqlmap`, `nikto`, `hydra`, `tcpdump`
-   through `apt-get`, but only the ones that are missing, and only if
+   and `bubblewrap` (the sandbox the coder's scripts run in) through
+   `apt-get`, but only the ones that are missing, and only if
    passwordless `sudo` is available. Without `sudo` it prints exactly what is
    missing instead of failing halfway.
 2. **john (jumbo)** - cloned and built from source into the tools directory,
@@ -150,7 +151,7 @@ never competes with logs, artifacts and findings for space.
 | orchestrator | turns the objective into a written plan | - |
 | planner | reorders the plan by risk and effort | - |
 | researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, web search | `dns_lookup`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
-| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
+| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `code_run` |
 | pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
 | reflector | judges evidence quality and confidence of every finding | `memory_search`, `ask_operator`, `plan_patch` |
 
@@ -170,6 +171,12 @@ In-process (no child process): `port_scan`, `dns_lookup`, `http_probe`,
 and silent unless you set `LANTERN_OPERATOR_ANSWER`), `plan_patch` (roles
 correct the plan once facts disagree with it, and later roles read the
 corrected version).
+
+One child process, and it is not a host binary: `code_run` - a single
+Python script (standard library only, nothing else the model can name)
+behind `bwrap`, with an empty network namespace and a read-only
+filesystem where only the flow's own directory is writable. It computes;
+it can never reach a target.
 
 Allowlisted host binaries, all provisioned by `lantern setup`:
 
@@ -217,7 +224,7 @@ Keys are read from the environment and **never written to disk**.
 | `LANTERN_MAX_OUTPUT_BYTES` | `2097152` | max captured output per command |
 | `LANTERN_CHILD_MEM_MB` / `LANTERN_CHILD_CPU_SECS` | `512` / `60` | child rlimits |
 | `LANTERN_PATH` | `/usr/local/bin:/usr/bin:/bin` + tools dirs | restricted `PATH` for children |
-| `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john` | host binaries that may run |
+| `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john,bwrap` | host binaries that may run |
 | `LANTERN_TOOLS_DIR` | `~/.local/share/lantern-tools` | where `lantern setup` provisions tools |
 | `LANTERN_NUCLEI_TEMPLATES` | `<tools-dir>/share/nuclei-templates` | template set for `host_nuclei` |
 | `LANTERN_OPERATOR_ANSWER` | - | reply for `ask_operator` when no terminal is attached |

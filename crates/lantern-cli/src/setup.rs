@@ -26,6 +26,7 @@ const PACKAGES: &[(&str, &str)] = &[
     ("nikto", "nikto"),
     ("hydra", "hydra"),
     ("tcpdump", "tcpdump"),
+    ("bwrap", "bubblewrap"),
 ];
 
 /// Toolchain needed to build john and to clone the template set.

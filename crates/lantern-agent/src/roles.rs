@@ -102,6 +102,7 @@ static ROLES: [Role; 6] = [
             "memory_store",
             "ask_operator",
             "plan_patch",
+            "code_run",
         ],
         max_steps: 2,
         emits_findings: true,
