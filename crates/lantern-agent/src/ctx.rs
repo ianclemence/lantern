@@ -8,10 +8,71 @@ use lantern_core::config::{Config, EmbedMode};
 use lantern_core::scope::Scope;
 use lantern_core::storage::Db;
 use lantern_llm::embed::{Embedder, NoEmbedder, OllamaEmbedder};
-use lantern_llm::provider::ChatProvider;
+use lantern_llm::provider::{ChatProvider, ChatReply, ChatRequest, Usage};
 use lantern_tools::ctx::ToolCtx;
 use lantern_tools::registry::Registry;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// What a flow actually spent, read back when it finishes.
+///
+/// Every number is measured rather than modelled: tokens come from the
+/// endpoint's own usage block, the context high-water mark from the working set
+/// that was really rendered. Together they answer the two questions the
+/// defaults were guessed on - what a run costs and whether the token budget
+/// ever got in the way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Footprint {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Largest working set any role reached before it was summarized.
+    pub peak_context: usize,
+    /// Times a working set was compressed to stay inside the budget.
+    pub summarizations: usize,
+    /// Times the budget ended a role before it said it was done.
+    pub budget_stops: usize,
+}
+
+/// Live counters for one flow. Every phase of the run writes to them, so they
+/// are atomic and the flow reads a snapshot once at the end.
+#[derive(Default)]
+pub struct Counters {
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    peak_context: AtomicUsize,
+    summarizations: AtomicUsize,
+    budget_stops: AtomicUsize,
+}
+
+impl Counters {
+    pub fn usage(&self, u: Usage) {
+        self.input_tokens.fetch_add(u.input_tokens, Ordering::Relaxed);
+        self.output_tokens.fetch_add(u.output_tokens, Ordering::Relaxed);
+    }
+
+    /// Note the size of a working set on its way out; only the peak matters.
+    pub fn context(&self, tokens: usize) {
+        self.peak_context.fetch_max(tokens, Ordering::Relaxed);
+    }
+
+    pub fn summarization(&self) {
+        self.summarizations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn budget_stop(&self) {
+        self.budget_stops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> Footprint {
+        Footprint {
+            input_tokens: self.input_tokens.load(Ordering::Relaxed),
+            output_tokens: self.output_tokens.load(Ordering::Relaxed),
+            peak_context: self.peak_context.load(Ordering::Relaxed),
+            summarizations: self.summarizations.load(Ordering::Relaxed),
+            budget_stops: self.budget_stops.load(Ordering::Relaxed),
+        }
+    }
+}
 
 pub struct AgentCtx {
     pub config: Arc<Config>,
@@ -22,6 +83,8 @@ pub struct AgentCtx {
     pub provider: Arc<dyn ChatProvider>,
     pub embedder: Arc<dyn Embedder>,
     pub dry_run: bool,
+    /// What the flow has spent so far. Counted, never estimated.
+    pub counters: Counters,
 }
 
 impl AgentCtx {
@@ -63,6 +126,7 @@ impl AgentCtx {
             provider,
             embedder,
             dry_run,
+            counters: Counters::default(),
         })
     }
 
@@ -90,7 +154,19 @@ impl AgentCtx {
         Memory::new(self.db.clone(), scope_key, self.embedder.clone())
     }
 
-    /// One-shot model call used by the plan phases.
+    /// One model call, counted.
+    ///
+    /// Every phase reaches the provider through here, so what the flow reports
+    /// at the end is what the endpoint actually billed rather than a number
+    /// reconstructed afterwards from logs.
+    pub async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatReply> {
+        let reply = self.provider.chat(request).await?;
+        if let Some(u) = reply.usage {
+            self.counters.usage(u);
+        }
+        Ok(reply)
+    }
+
     /// One-shot completion for the planning and reflection phases.
     ///
     /// A reasoning model spends the completion budget thinking before it
@@ -102,7 +178,6 @@ impl AgentCtx {
         let mut budget = max_tokens.saturating_mul(4).max(2_048);
         for attempt in 0..2u8 {
             let reply = self
-                .provider
                 .chat(
                     lantern_llm::provider::ChatRequest::new(vec![
                         lantern_llm::provider::Message::system(
@@ -227,5 +302,50 @@ mod tests {
         assert!(t.check_scope("evil.test").is_err());
         assert!(t.workdir.ends_with("flw_x"));
         assert!(!t.offensive);
+    }
+
+    #[tokio::test]
+    async fn every_model_call_adds_what_it_cost() {
+        use lantern_llm::mock::{MockProvider, Scripted};
+        use lantern_llm::provider::Message;
+        let mock = Arc::new(MockProvider::with_script(vec![
+            Scripted::Text("first".into()),
+            Scripted::Text("second".into()),
+        ]));
+        let ctx = AgentCtx::new(config(), "example.com", true)
+            .unwrap()
+            .with_provider(mock);
+
+        for _ in 0..2 {
+            ctx.chat(ChatRequest::new(vec![Message::user("hi")]))
+                .await
+                .unwrap();
+        }
+
+        let fp = ctx.counters.snapshot();
+        assert!(
+            fp.input_tokens > 0,
+            "the endpoint's own usage block must reach the footprint: {fp:?}"
+        );
+        assert_eq!(
+            fp.output_tokens, 16,
+            "two scripted replies at 8 output tokens each"
+        );
+    }
+
+    #[test]
+    fn the_footprint_keeps_peaks_not_last_readings() {
+        let c = Counters::default();
+        c.context(100);
+        c.context(900);
+        c.context(500);
+        c.summarization();
+        c.budget_stop();
+
+        let fp = c.snapshot();
+        assert_eq!(fp.peak_context, 900, "the high-water mark survives");
+        assert_eq!(fp.summarizations, 1);
+        assert_eq!(fp.budget_stops, 1);
+        assert_eq!(fp.input_tokens, 0, "nothing was called");
     }
 }

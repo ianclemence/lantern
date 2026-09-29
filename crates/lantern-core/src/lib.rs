@@ -33,6 +33,33 @@ pub fn text_clip(text: &str, max_tokens: usize) -> String {
     format!("[...truncated...]\n{}", &text[idx..])
 }
 
+/// Digits with thousands separators (`41,208`). Format strings carry no
+/// grouping of their own, and a token count nobody can read at a glance is a
+/// measurement nobody acts on.
+pub fn grouped(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod group_tests {
+    #[test]
+    fn groups_by_thousands() {
+        assert_eq!(crate::grouped(0), "0");
+        assert_eq!(crate::grouped(999), "999");
+        assert_eq!(crate::grouped(1_000), "1,000");
+        assert_eq!(crate::grouped(41_208), "41,208");
+        assert_eq!(crate::grouped(1_234_567), "1,234,567");
+    }
+}
+
 #[cfg(test)]
 mod clip_tests {
     #[test]

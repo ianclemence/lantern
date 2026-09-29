@@ -7,7 +7,7 @@
 //! * a role failure is recorded and does not abort the flow - the report has to
 //!   explain what happened, including partial runs.
 
-use crate::ctx::AgentCtx;
+use crate::ctx::{AgentCtx, Footprint};
 use crate::findings;
 use crate::prompts;
 use crate::report;
@@ -86,6 +86,10 @@ pub struct FlowOutcome {
     pub report: Option<PathBuf>,
     pub warnings: Vec<String>,
     pub elapsed_ms: u64,
+    /// Measured spend: what the endpoint billed and how hard the context
+    /// budget was pushed. Read back so the operator can tune the defaults from
+    /// a run instead of from a guess.
+    pub footprint: Footprint,
 }
 
 fn default_plan(target: &str) -> String {
@@ -139,7 +143,8 @@ pub async fn run_flow(agent: &AgentCtx, opts: FlowOptions) -> anyhow::Result<Flo
     let outcome = run_inner(agent, &flow_id, &target, &scope, &opts, &order).await;
     match &outcome {
         Ok(o) => {
-            agent.db.set_flow_stats(&flow_id, o.steps, o.tool_calls)?;
+            // Status, counters and spend were already on the row before the
+            // report was rendered; only the completion event is left.
             agent.db.set_flow_status(&flow_id, "completed")?;
             agent.db.add_event(
                 Some(&flow_id),
@@ -282,6 +287,24 @@ async fn run_inner(
     }
 
     // --- report -----------------------------------------------------------
+    // Rendered last, but describing a flow that is finished: status, counters
+    // and spend go on the row *before* the report reads them. Otherwise every
+    // report claims the flow is still running and quotes whatever fallback the
+    // rows can offer instead of what the run measured.
+    let footprint = agent.counters.snapshot();
+    agent.db.set_flow_status(flow_id, "completed")?;
+    agent.db.set_flow_stats(flow_id, steps, tool_ctx.tool_call_count())?;
+    agent.db.set_flow_footprint(
+        flow_id,
+        &json!({
+            "input_tokens": footprint.input_tokens,
+            "output_tokens": footprint.output_tokens,
+            "peak_context": footprint.peak_context,
+            "summarizations": footprint.summarizations,
+            "budget_stops": footprint.budget_stops,
+            "budget": agent.config.token_budget,
+        }),
+    )?;
     let findings_count = agent.db.findings_for_flow(flow_id)?.len();
     let path = report::write(&agent.config, &agent.db, flow_id)
         .context("writing the report")
@@ -301,6 +324,7 @@ async fn run_inner(
         report: path,
         warnings,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        footprint,
     })
 }
 
@@ -461,8 +485,8 @@ async fn role_loop(
             .with_tools(defs.clone())
             .max_tokens(agent.config.llm.max_output_tokens)
             .temperature(agent.config.llm.temperature);
+        agent.counters.context(window.tokens());
         let reply = agent
-            .provider
             .chat(request)
             .await
             .with_context(|| format!("model call for {id}"))?;
@@ -505,12 +529,20 @@ async fn role_loop(
         if window.needs_summary() {
             let transcript = window.material_for_summary();
             let prompt = lantern_llm::context::summarization_prompt(&transcript);
-            match agent.provider.chat(ChatRequest::new(prompt).max_tokens(500)).await {
-                Ok(reply) => window.apply_summary(reply.text().to_string()),
+            match agent.chat(ChatRequest::new(prompt).max_tokens(500)).await {
+                Ok(reply) => {
+                    window.apply_summary(reply.text().to_string());
+                    agent.counters.summarization();
+                }
                 Err(e) => tracing::warn!(error = %e, "summarization failed; keeping the transcript"),
             }
         }
+        agent.counters.context(window.tokens());
         if window.tokens() >= agent.config.token_budget {
+            // The cap ends the role here, whatever it still had left to say.
+            // Counted so a budget set too low shows up as stops instead of as
+            // quietly shorter answers.
+            agent.counters.budget_stop();
             break;
         }
     }
@@ -652,6 +684,16 @@ mod tests {
         assert!(out.report.is_some(), "report path: {:?}", out.warnings);
         let body = std::fs::read_to_string(out.report.unwrap()).unwrap();
         assert!(body.contains("Closed port 1"));
+        // The report describes a finished flow: final status, the counters the
+        // run measured and what it spent - not what the rows held before the
+        // last role returned.
+        assert!(body.contains("Status: completed"), "not still running: {body}");
+        assert!(
+            body.contains(&format!("{} model step(s)", out.steps)),
+            "quoted step counter: {body}"
+        );
+        assert!(body.contains("Context peaked at"), "spend is recorded: {body}");
+        assert!(body.contains("tokens"), "token line: {body}");
 
         let flow = agent.db.get_flow(&out.flow_id).unwrap().unwrap();
         assert_eq!(flow.status, "completed");

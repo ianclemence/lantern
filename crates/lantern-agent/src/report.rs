@@ -54,6 +54,11 @@ pub fn build(db: &Db, flow_id: &str) -> anyhow::Result<String> {
         .get("offensive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let scripted = flow
+        .options
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if active {
         s.push_str("> **Active testing was enabled for this flow** (`--offensive`).\n\n");
     }
@@ -71,12 +76,41 @@ pub fn build(db: &Db, flow_id: &str) -> anyhow::Result<String> {
         .get("tool_calls")
         .and_then(|v| v.as_u64())
         .unwrap_or(commands.len() as u64);
+    let footprint = flow.options.get("footprint");
+    let counter = |key: &str| -> u64 {
+        footprint
+            .and_then(|f| f.get(key))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    // Token spend only appears when a run actually measured it: an older flow
+    // says nothing instead of claiming it spent nothing.
+    let tokens = if footprint.is_some() {
+        format!(
+            ", {} in / {} out tokens{}",
+            lantern_core::grouped(counter("input_tokens")),
+            lantern_core::grouped(counter("output_tokens")),
+            if scripted { " (scripted - estimate)" } else { "" }
+        )
+    } else {
+        String::new()
+    };
     s.push_str(&format!(
-        "{} finding(s), {} tool invocation(s), {} model step(s).\n\n",
+        "{} finding(s), {} tool invocation(s), {} model step(s){}.\n\n",
         findings.len(),
         invocations,
         steps,
+        tokens,
     ));
+    if footprint.and_then(|f| f.get("budget")).is_some() {
+        s.push_str(&format!(
+            "Context peaked at {} of {} tokens: {} summarization(s), {} budget stop(s).\n\n",
+            lantern_core::grouped(counter("peak_context")),
+            lantern_core::grouped(counter("budget")),
+            counter("summarizations"),
+            counter("budget_stops"),
+        ));
+    }
 
     if findings.is_empty() {
         s.push_str("_No findings were recorded._\n\n");

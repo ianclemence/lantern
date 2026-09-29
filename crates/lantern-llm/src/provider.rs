@@ -186,8 +186,18 @@ impl ChatRequest {
         self
     }
 
+    /// Rough size of the whole call: the messages *and* the tool schemas.
+    /// Every endpoint bills the schemas on each request even though they never
+    /// appear in the conversation, so leaving them out would understate a run
+    /// by a few thousand tokens.
     pub fn estimate_tokens(&self) -> usize {
-        self.messages.iter().map(|m| m.estimate_tokens()).sum()
+        let messages: usize = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+        let schemas: usize = self
+            .tools
+            .iter()
+            .map(|t| (t.wire().to_string().len() + 3) / 4)
+            .sum();
+        messages + schemas
     }
 }
 
@@ -234,6 +244,26 @@ mod tests {
         assert!(m.estimate_tokens() >= 4);
         let req = ChatRequest::new(vec![Message::system("abc"), m]);
         assert!(req.estimate_tokens() > 0);
+    }
+
+    #[test]
+    fn the_estimate_counts_the_tool_schemas_too() {
+        // Every endpoint bills the schemas on every request even though they
+        // never appear in the conversation - on this build they are the
+        // largest single part of a call, so leaving them out would understate
+        // a run by a few thousand tokens.
+        let messages = || vec![Message::system("abc"), Message::user("hello world")];
+        let bare = ChatRequest::new(messages()).estimate_tokens();
+        let with_tools = ChatRequest::new(messages())
+            .with_tools(vec![
+                ToolDef::new("port_scan", "scan a host", serde_json::json!({"type":"object"})),
+                ToolDef::new("dns_lookup", "resolve names", serde_json::json!({"type":"object"})),
+            ])
+            .estimate_tokens();
+        assert!(
+            with_tools > bare,
+            "schemas must count: {bare} tokens bare, {with_tools} with two tools"
+        );
     }
 
     #[test]

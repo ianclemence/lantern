@@ -13,7 +13,7 @@ pub mod report;
 pub mod roles;
 pub mod runtime;
 
-pub use ctx::AgentCtx;
+pub use ctx::{AgentCtx, Footprint};
 pub use provider::provider_for;
 pub use roles::RoleId;
 pub use runtime::{run_flow, FlowOptions, FlowOutcome, RoleOutcome};

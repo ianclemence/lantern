@@ -95,10 +95,13 @@ impl Db {
         })
     }
 
-    /// Record the counters the report quotes: model steps and tool
-    /// invocations. They are merged into the flow's options, so whatever is
-    /// already there (offensive, roles, dry_run) survives.
-    pub fn set_flow_stats(&self, id: &str, steps: usize, tool_calls: usize) -> Result<()> {
+    /// Merge one key into a flow's options, leaving the rest (offensive,
+    /// roles, dry_run) alone.
+    fn update_flow_options(
+        &self,
+        id: &str,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<()> {
         let mut options = self
             .get_flow(id)?
             .ok_or_else(|| crate::CoreError::Other(format!("no such flow: {id}")))?
@@ -106,14 +109,32 @@ impl Db {
         if !options.is_object() {
             options = serde_json::json!({});
         }
-        options["steps"] = serde_json::json!(steps);
-        options["tool_calls"] = serde_json::json!(tool_calls);
+        mutate(&mut options);
         self.with(|c| {
             c.execute(
                 "UPDATE flows SET options = ?1, updated_at = ?2 WHERE id = ?3",
                 params![options.to_string(), timeutil::now(), id],
             )?;
             Ok(())
+        })
+    }
+
+    /// Record the counters the report quotes: model steps and tool
+    /// invocations.
+    pub fn set_flow_stats(&self, id: &str, steps: usize, tool_calls: usize) -> Result<()> {
+        self.update_flow_options(id, |options| {
+            options["steps"] = serde_json::json!(steps);
+            options["tool_calls"] = serde_json::json!(tool_calls);
+        })
+    }
+
+    /// Record what the flow spent: billed tokens and how hard the context
+    /// budget was pushed, in one object under `options.footprint`. A flow from
+    /// before the measurement existed has no key at all rather than zeroes, so
+    /// the report can tell "nothing measured" from "nothing spent".
+    pub fn set_flow_footprint(&self, id: &str, footprint: &serde_json::Value) -> Result<()> {
+        self.update_flow_options(id, |options| {
+            options["footprint"] = footprint.clone();
         })
     }
 
