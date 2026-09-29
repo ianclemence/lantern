@@ -22,6 +22,8 @@ pub struct ToolCtx {
     pub flow_id: Option<String>,
     pub workdir: PathBuf,
     pub offensive: bool,
+    /// The operator may be asked a question: `lantern run --interactive`.
+    pub interactive: bool,
     pub http: reqwest::Client,
     pub embedder: Arc<dyn Embedder>,
 }
@@ -61,6 +63,7 @@ impl ToolCtx {
             flow_id,
             workdir,
             offensive,
+            interactive: false,
             http,
             embedder,
         })

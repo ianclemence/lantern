@@ -32,6 +32,8 @@ pub struct FlowOptions {
     pub roles: Vec<RoleId>,
     /// Override the per-role step cap (clamped down, never up, per role).
     pub max_steps: Option<usize>,
+    /// Roles may stop and ask the operator a question (`ask_operator`).
+    pub interactive: bool,
 }
 
 impl FlowOptions {
@@ -42,11 +44,17 @@ impl FlowOptions {
             offensive: false,
             roles: Vec::new(),
             max_steps: None,
+            interactive: false,
         }
     }
 
     pub fn offensive(mut self, yes: bool) -> Self {
         self.offensive = yes;
+        self
+    }
+
+    pub fn interactive(mut self, yes: bool) -> Self {
+        self.interactive = yes;
         self
     }
 
@@ -167,9 +175,10 @@ async fn run_inner(
     opts: &FlowOptions,
     order: &[RoleId],
 ) -> anyhow::Result<FlowOutcome> {
-    let tool_ctx = agent
+    let mut tool_ctx = agent
         .tool_ctx(Some(flow_id), opts.offensive)
         .context("creating the flow execution context")?;
+    tool_ctx.interactive = opts.interactive;
     let memory = agent.memory(scope);
     let mut warnings: Vec<String> = Vec::new();
     let mut outcomes: Vec<RoleOutcome> = Vec::new();

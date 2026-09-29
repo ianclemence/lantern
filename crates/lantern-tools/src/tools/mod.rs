@@ -4,6 +4,7 @@
 
 pub mod dirb;
 pub mod dns;
+pub mod ask;
 pub mod host;
 pub mod http_probe;
 pub mod knowledge;

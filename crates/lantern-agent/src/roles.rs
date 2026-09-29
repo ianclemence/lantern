@@ -88,6 +88,7 @@ static ROLES: [Role; 6] = [
             "port_scan",
             "memory_search",
             "memory_store",
+            "ask_operator",
         ],
         max_steps: 6,
         emits_findings: true,
@@ -95,7 +96,7 @@ static ROLES: [Role; 6] = [
     Role {
         id: RoleId::Coder,
         mission: "Turn observations into reproducible check steps and remediation advice.",
-        focus: &["memory_search", "memory_store"],
+        focus: &["memory_search", "memory_store", "ask_operator"],
         max_steps: 2,
         emits_findings: true,
     },
@@ -116,6 +117,7 @@ static ROLES: [Role; 6] = [
             "host_john",
             "memory_search",
             "memory_store",
+            "ask_operator",
         ],
         max_steps: 6,
         emits_findings: true,
@@ -123,7 +125,7 @@ static ROLES: [Role; 6] = [
     Role {
         id: RoleId::Reflector,
         mission: "Judge evidence quality and confidence of every finding.",
-        focus: &["memory_search"],
+        focus: &["memory_search", "ask_operator"],
         max_steps: 1,
         emits_findings: false,
     },

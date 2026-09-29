@@ -92,6 +92,7 @@ lantern run --target 10.10.5.4 --scope 10.10.5.0/24 \
             --offensive                         # ...and now the gated tools may run
 lantern run --target 127.0.0.1 --scope 127.0.0.1 --dry-run   # scripted, free
 lantern run ... --roles researcher,pentester    # pick the roles
+lantern run ... --interactive                   # ...and let a role ask you a question
 lantern flows                                   # what has been run
 lantern report flw_abc123                       # markdown report to stdout
 lantern report flw_abc123 --out report.md
@@ -148,10 +149,10 @@ never competes with logs, artifacts and findings for space.
 |---|---|---|
 | orchestrator | turns the objective into a written plan | - |
 | planner | reorders the plan by risk and effort | - |
-| researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, web search | `dns_lookup`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store` |
-| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store` |
-| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `memory_search`, `memory_store` |
-| reflector | judges evidence quality and confidence of every finding | `memory_search` |
+| researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, web search | `dns_lookup`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator` |
+| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator` |
+| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `memory_search`, `memory_store`, `ask_operator` |
+| reflector | judges evidence quality and confidence of every finding | `memory_search`, `ask_operator` |
 
 \* requires `--offensive`.
 
@@ -164,7 +165,8 @@ gate *before* the tool body runs.
 In-process (no child process): `port_scan`, `dns_lookup`, `http_probe`,
 `tls_inspect`, `whois`, `dir_bruteforce` (built-in 2,419-entry wordlist),
 `web_search` (DuckDuckGo HTML by default, a search API if you configure one),
-`memory_search`, `memory_store`.
+`memory_search`, `memory_store`, `ask_operator` (only under `--interactive`,
+and silent unless you set `LANTERN_OPERATOR_ANSWER`).
 
 Allowlisted host binaries, all provisioned by `lantern setup`:
 
@@ -215,6 +217,7 @@ Keys are read from the environment and **never written to disk**.
 | `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john` | host binaries that may run |
 | `LANTERN_TOOLS_DIR` | `~/.local/share/lantern-tools` | where `lantern setup` provisions tools |
 | `LANTERN_NUCLEI_TEMPLATES` | `<tools-dir>/share/nuclei-templates` | template set for `host_nuclei` |
+| `LANTERN_OPERATOR_ANSWER` | - | reply for `ask_operator` when no terminal is attached |
 | `LANTERN_OFFENSIVE` | `0` | same as `--offensive` |
 | `LANTERN_OFFLINE` | `0` | no external calls at all |
 | `LANTERN_TOKEN_BUDGET` | `6000` | context window budget per role |

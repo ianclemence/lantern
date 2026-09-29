@@ -67,6 +67,10 @@ enum Cmd {
         /// Cap model steps per role (can only lower a role's own cap)
         #[arg(long)]
         steps: Option<usize>,
+        /// Let roles stop and ask you a question before deciding. Without a
+        /// terminal, set LANTERN_OPERATOR_ANSWER to reply unattended.
+        #[arg(long)]
+        interactive: bool,
     },
     /// List recorded flows
     Flows {
@@ -123,6 +127,7 @@ async fn real_main() -> anyhow::Result<()> {
                     offensive,
                     dry_run,
                     steps,
+                    interactive,
                 } => {
                     config.offensive = config.offensive || offensive;
                     run::run(
@@ -134,6 +139,7 @@ async fn real_main() -> anyhow::Result<()> {
                             offensive,
                             dry_run,
                             steps,
+                            interactive,
                         },
                     )
                     .await?;

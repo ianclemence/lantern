@@ -12,6 +12,7 @@ pub struct Args {
     pub offensive: bool,
     pub dry_run: bool,
     pub steps: Option<usize>,
+    pub interactive: bool,
 }
 
 fn parse_roles(spec: Option<&str>) -> anyhow::Result<Vec<RoleId>> {
@@ -56,8 +57,13 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
     let scope = agent.scope.render();
     let mut opts = FlowOptions::new(&args.target, &scope)
         .offensive(args.offensive)
+        .interactive(args.interactive)
         .roles(roles);
     opts.max_steps = args.steps;
+
+    if args.interactive {
+        println!("operator questions ENABLED (--interactive): roles may pause for your answer\n");
+    }
 
     if args.offensive {
         println!(

@@ -88,6 +88,7 @@ impl Registry {
             Arc::new(crate::tools::search::WebSearch),
             Arc::new(crate::tools::knowledge::MemorySearch),
             Arc::new(crate::tools::knowledge::MemoryStore),
+            Arc::new(crate::tools::ask::AskOperator),
         ];
         tools.sort_by_key(|t| t.name());
 
@@ -218,6 +219,7 @@ mod tests {
             "web_search",
             "memory_search",
             "memory_store",
+            "ask_operator",
         ] {
             let t = reg.get(name).unwrap_or_else(|| panic!("missing {name}"));
             assert!(!t.name().is_empty());
