@@ -6,9 +6,11 @@
 //! key is verified with a real one-line completion before it is stored - a key
 //! that cannot talk to the endpoint is not worth saving.
 //!
-//! Nothing is asked when stdin is not a terminal: `lantern setup` in a script
-//! still provisions the tools and leaves the model configuration to the
-//! environment.
+//! Nothing is asked when stdin is not a terminal. A scripted run has nobody to
+//! question, so it takes the answer the environment already gives - provider,
+//! model and key - checks it with one real call and stores it; and when the
+//! environment cannot finish the job, the message names the one variable that
+//! would.
 
 use crate::prefs;
 use lantern_core::config::Config;
@@ -18,7 +20,7 @@ use std::time::{Duration, Instant};
 
 /// What the operator settled on. `None` from `run` means "nothing to save".
 pub struct Outcome {
-    pub provider: &'static str,
+    pub provider: String,
     pub model: String,
     pub base_url: String,
     pub key_saved: bool,
@@ -26,11 +28,7 @@ pub struct Outcome {
 
 pub async fn run(config: &Config) -> anyhow::Result<Option<Outcome>> {
     if !std::io::stdin().is_terminal() {
-        crate::setup::skipped(
-            "AI provider: no terminal here - export the key as an environment variable, or re-run \
-             `lantern setup` in a terminal to be walked through provider, model and key",
-        );
-        return Ok(None);
+        return scripted(config).await;
     }
     if config.offline {
         crate::setup::skipped("AI provider: offline mode - nothing to ask for");
@@ -198,11 +196,129 @@ pub async fn run(config: &Config) -> anyhow::Result<Option<Outcome>> {
     ));
 
     Ok(Some(Outcome {
-        provider: chosen.id,
+        provider: chosen.id.to_string(),
         model,
         base_url,
         key_saved,
     }))
+}
+
+// --- without a terminal -----------------------------------------------------
+
+/// `lantern setup` with no one at the keyboard.
+///
+/// The whole configuration may already be in the environment - that is how a
+/// script or a fresh machine is usually provisioned - so it is stored instead
+/// of ignored, after one real call has shown it works. When the environment is
+/// missing something, nothing is written and the message says which single
+/// variable would finish the job.
+async fn scripted(config: &Config) -> anyhow::Result<Option<Outcome>> {
+    if config.offline {
+        crate::setup::skipped("AI provider: offline mode - nothing to ask for");
+        return Ok(None);
+    }
+
+    let provider = config.llm.provider.trim().to_string();
+    let model = config.llm.model.trim().to_string();
+    let base_url = config.llm.base_url.trim().trim_end_matches('/').to_string();
+    let key = config.llm.api_key.trim().to_string();
+
+    if let Err(gap) = scripted_gap(&provider, &model, &base_url, &key) {
+        crate::setup::skipped(&skip_message(&gap));
+        return Ok(None);
+    }
+    let preset = providers::by_id(&provider).expect("scripted_gap rejected anything unknown");
+    let key_env = preset.key_env.unwrap_or("LANTERN_LLM_API_KEY");
+    let stored_key = prefs::read_credentials()
+        .get(key_env)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let saved = prefs::read_prefs();
+    let unchanged = saved.provider.as_deref() == Some(provider.as_str())
+        && saved.model.as_deref() == Some(model.as_str())
+        && saved.base_url.as_deref() == Some(base_url.as_str())
+        && stored_key == key;
+    if unchanged {
+        crate::setup::ok(&format!("already configured: {} / {model}", preset.name));
+        return Ok(None);
+    }
+
+    // One real call first: in a script there is nobody to answer "save it
+    // anyway?", so a failed check is reported and the files are written
+    // regardless - the environment supplied this key, and refusing to persist
+    // it would only make the next run ask again.
+    match ping(config, &provider, &base_url, &model, &key).await {
+        Ok((reply, ms)) => {
+            let one: String = reply.split_whitespace().take(8).collect::<Vec<_>>().join(" ");
+            crate::setup::ok(&format!(
+                "connected in {ms} ms - \"{}\"",
+                one.chars().take(60).collect::<String>()
+            ));
+        }
+        Err(e) => crate::setup::warn(&redact(&e, &key)),
+    }
+
+    prefs::save_prefs(&provider, &model, &base_url)?;
+    let mut key_saved = false;
+    if !key.is_empty() && stored_key != key {
+        prefs::save_key(key_env, &key)?;
+        key_saved = true;
+    }
+    crate::setup::ok(&format!(
+        "saved {}/config.json{}",
+        prefs::dir().display(),
+        if key_saved {
+            " and credentials (mode 0600)"
+        } else {
+            ""
+        }
+    ));
+
+    Ok(Some(Outcome {
+        provider,
+        model,
+        base_url,
+        key_saved,
+    }))
+}
+
+/// The one thing still missing before a scripted setup can store anything.
+/// `Err` carries the message shown to the operator.
+fn scripted_gap(provider: &str, model: &str, base_url: &str, key: &str) -> Result<(), String> {
+    let Some(preset) = providers::by_id(provider) else {
+        return Err(format!(
+            "this build has no provider preset `{provider}` (known: {})",
+            providers::PROVIDERS
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    if model.is_empty() {
+        return Err("set LANTERN_LLM_MODEL - this preset has no default model".to_string());
+    }
+    if base_url.is_empty() {
+        return Err("set LANTERN_LLM_BASE_URL - this preset has no default endpoint".to_string());
+    }
+    if let Some(env_name) = preset.key_env {
+        if key.is_empty() {
+            return Err(format!("export {env_name}"));
+        }
+    }
+    Ok(())
+}
+
+/// What `skipped` prints. Built from the gap so the variable that would finish
+/// the job is always named - a script should never have to guess.
+fn skip_message(gap: &str) -> String {
+    format!(
+        "AI provider: no terminal here - {gap}; run `lantern setup` in a terminal to be walked \
+         through provider, model and key"
+    )
 }
 
 // --- prompting -------------------------------------------------------------
@@ -537,12 +653,56 @@ mod tests {
     }
 
     #[test]
-    fn probing_without_a_terminal_is_skipped_not_guessed() {
-        // `run` checks stdin up front; everything it does afterwards needs a
-        // human, so the only assertion worth making here is that the config
-        // object it would mutate is unchanged by construction.
+    fn a_scripted_setup_names_the_variable_it_is_waiting_for() {
+        let err = scripted_gap("deepseek", "deepseek-flash", "https://api.deepseek.com", "")
+            .err()
+            .expect("a key-requiring provider with no key must stop here");
+        assert!(err.contains("DEEPSEEK_API_KEY"), "names the exact variable: {err}");
+
+        let msg = skip_message(&err);
+        assert!(msg.contains("DEEPSEEK_API_KEY"), "{msg}");
+        assert!(msg.contains("no terminal"), "{msg}");
+        assert!(msg.contains("lantern setup"), "points at the guided way: {msg}");
+    }
+
+    #[test]
+    fn a_default_configuration_alone_is_not_enough_to_store() {
+        // What a bare `lantern setup` in a script has to work with: a preset
+        // and no key. It has to stop and ask for the right variable rather
+        // than write a configuration that cannot run.
         let c = config();
-        assert_eq!(c.llm.provider, "deepseek");
-        assert!(!c.offline);
+        let err = scripted_gap(&c.llm.provider, &c.llm.model, &c.llm.base_url, &c.llm.api_key)
+            .err()
+            .expect("preset defaults with no key must not be saved");
+        assert!(err.contains("DEEPSEEK_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn a_scripted_setup_stores_what_the_environment_already_says() {
+        assert!(
+            scripted_gap("deepseek", "deepseek-flash", "https://api.deepseek.com", "sk-x").is_ok()
+        );
+        // A keyless endpoint is complete without a key at all.
+        assert!(scripted_gap("ollama", "llama3.2", "http://127.0.0.1:11434/v1", "").is_ok());
+        assert!(scripted_gap("custom", "mymodel", "http://127.0.0.1:8000/v1", "").is_ok());
+    }
+
+    #[test]
+    fn a_scripted_setup_never_invents_a_model_or_an_endpoint() {
+        let m = scripted_gap("ollama", "", "http://127.0.0.1:11434/v1", "")
+            .err()
+            .expect("ollama has no default model to store");
+        assert!(m.contains("LANTERN_LLM_MODEL"), "{m}");
+
+        let b = scripted_gap("custom", "mymodel", "", "")
+            .err()
+            .expect("a custom endpoint has to be told where it is");
+        assert!(b.contains("LANTERN_LLM_BASE_URL"), "{b}");
+
+        let p = scripted_gap("typo", "m", "http://127.0.0.1:8000/v1", "k")
+            .err()
+            .expect("an unknown preset must be reported, not stored");
+        assert!(p.contains("no provider preset"), "{p}");
+        assert!(p.contains("deepseek"), "and lists what is available: {p}");
     }
 }

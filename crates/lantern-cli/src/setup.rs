@@ -86,7 +86,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // The model half of the setup comes first: three questions and one API
     // call, while the provisioning steps below can take minutes. Without a
-    // terminal there is nobody to ask, so the wizard says so and stands down.
+    // terminal there is nobody to ask, so it stores the configuration the
+    // environment already describes - or says which variable is missing.
     let wizard = crate::wizard::run(&config).await?;
 
     // Provisioning runs under wider limits than an assessment does: unpacking a
