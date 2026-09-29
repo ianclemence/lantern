@@ -9,6 +9,7 @@ pub mod device;
 pub mod error;
 pub mod ids;
 pub mod logging;
+pub mod providers;
 pub mod retention;
 pub mod scope;
 pub mod storage;

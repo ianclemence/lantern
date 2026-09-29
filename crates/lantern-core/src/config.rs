@@ -1,15 +1,20 @@
 //! Runtime configuration.
 //!
-//! Everything is environment-driven and every value has a device-appropriate
-//! default. API keys are read from the environment into memory only: this module
-//! is never serialized to disk, and no code path writes a credential to a file.
+//! This module only reads the environment: preferences and the credentials file
+//! are layered on by the CLI (`prefs`) before anything runs, and nothing here
+//! writes to disk. Every value falls back to a device-appropriate default, so a
+//! fresh clone boots with no setup at all.
 
 use crate::error::{CoreError, Result};
+use crate::providers;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
-    /// OpenAI-compatible endpoint.
+    /// Preset id: selects the wire format, the default endpoint and the key
+    /// variable. `LANTERN_LLM_PROVIDER` or the preferences file set it.
+    pub provider: String,
+    /// Endpoint the client posts to.
     pub base_url: String,
     pub model: String,
     pub api_key: String,
@@ -213,8 +218,20 @@ impl Config {
         );
 
         let concurrency = env_usize("LANTERN_CONCURRENCY", 3).clamp(1, 8);
-        let llm_base = env_str("LANTERN_LLM_BASE_URL").unwrap_or_else(|| "https://api.deepseek.com".into());
-        let llm_key = env_str("DEEPSEEK_API_KEY")
+        // Provider first: it decides the endpoint default and which key
+        // variable counts. An unknown id means the operator named something
+        // this build has no table for, so every default stays empty and the
+        // client reports which value is missing rather than guessing.
+        let llm_provider =
+            env_str("LANTERN_LLM_PROVIDER").unwrap_or_else(|| providers::DEFAULT_PROVIDER.to_string());
+        let preset = providers::by_id(&llm_provider);
+        let llm_base = env_str("LANTERN_LLM_BASE_URL")
+            .unwrap_or_else(|| preset.map(|p| p.base_url.to_string()).unwrap_or_default());
+        let llm_model = env_str("LANTERN_LLM_MODEL")
+            .unwrap_or_else(|| preset.map(|p| p.default_model.to_string()).unwrap_or_default());
+        let llm_key = preset
+            .and_then(|p| p.key_env)
+            .and_then(env_str)
             .or_else(|| env_str("LANTERN_LLM_API_KEY"))
             .unwrap_or_default();
 
@@ -267,8 +284,9 @@ impl Config {
             keep_recent_tokens: env_usize("LANTERN_KEEP_RECENT_TOKENS", 1_500),
             ram_per_task_bytes: env_u64("LANTERN_TASK_RAM_MB", 192) * 1024 * 1024,
             llm: LlmConfig {
+                provider: llm_provider,
                 base_url: llm_base.trim_end_matches('/').to_string(),
-                model: env_str("LANTERN_LLM_MODEL").unwrap_or_else(|| "deepseek-flash".into()),
+                model: llm_model,
                 api_key: llm_key,
                 timeout_secs: env_u64("LANTERN_LLM_TIMEOUT_SECS", 90),
                 max_output_tokens: env_u64("LANTERN_LLM_MAX_TOKENS", 2_000) as u32,
@@ -284,10 +302,18 @@ impl Config {
         !self.llm.api_key.is_empty()
     }
 
+    /// False only for endpoints that need no key at all, such as a local
+    /// server on this device.
+    pub fn provider_needs_key(&self) -> bool {
+        providers::by_id(&self.llm.provider)
+            .map(|p| p.key_env.is_some())
+            .unwrap_or(true)
+    }
+
     /// True when the agent can still operate (tools run, reports render) but no
     /// model calls will be attempted.
     pub fn degraded(&self) -> bool {
-        !self.has_llm_key() && !self.offline
+        !self.has_llm_key() && !self.offline && self.provider_needs_key()
     }
 
     /// Ensure the data root exists, then return it.

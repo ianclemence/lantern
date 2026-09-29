@@ -8,13 +8,10 @@ use lantern_core::config::{Config, EmbedMode};
 use lantern_core::scope::Scope;
 use lantern_core::storage::Db;
 use lantern_llm::embed::{Embedder, NoEmbedder, OllamaEmbedder};
-use lantern_llm::mock::MockProvider;
-use lantern_llm::openai_compat::OpenAiCompat;
 use lantern_llm::provider::ChatProvider;
 use lantern_tools::ctx::ToolCtx;
 use lantern_tools::registry::Registry;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct AgentCtx {
     pub config: Arc<Config>,
@@ -44,25 +41,9 @@ impl AgentCtx {
         let budget = Arc::new(Budget::new(config.data_cap_bytes, existing));
         let registry = Registry::new(&config).context("building tool registry")?;
 
-        let provider: Arc<dyn ChatProvider> = if dry_run {
-            Arc::new(MockProvider::new())
-        } else if config.offline {
-            anyhow::bail!("offline mode: no model calls possible (use --dry-run for a scripted run)");
-        } else if !config.has_llm_key() {
-            anyhow::bail!(
-                "no generation key: set DEEPSEEK_API_KEY in the environment (keys are never written to disk)"
-            );
-        } else {
-            Arc::new(
-                OpenAiCompat::new(
-                    &config.llm.base_url,
-                    &config.llm.model,
-                    &config.llm.api_key,
-                    Duration::from_secs(config.llm.timeout_secs),
-                )
-                .context("building model client")?,
-            )
-        };
+        // One factory for the agent and the wizard, so both agree on when a
+        // configuration is runnable.
+        let provider = crate::provider::provider_for(&config, dry_run)?;
 
         let embedder: Arc<dyn Embedder> = match config.embed.mode {
             EmbedMode::Ollama => Arc::new(OllamaEmbedder::new(
