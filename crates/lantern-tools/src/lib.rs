@@ -7,6 +7,7 @@
 
 pub mod ctx;
 pub mod exec;
+pub mod fetch;
 pub mod memory;
 pub mod registry;
 pub mod tools;

@@ -152,15 +152,18 @@ impl Tool for HttpProbe {
 
             let mut body = String::new();
             let mut body_bytes = 0usize;
+            let mut body_truncated = false;
             if method == "GET" && status != reqwest::StatusCode::NO_CONTENT {
-                match resp.bytes().await {
-                    Ok(b) => {
-                        body_bytes = b.len();
-                        let take = (b.len()).min(max_body as usize);
-                        body = String::from_utf8_lossy(&b[..take]).into_owned();
-                    }
-                    Err(e) => tracing::debug!(error = %e, "body read failed"),
-                }
+                // Bounded at the network read itself, not just truncated
+                // after the fact: a hostile or compromised target serving a
+                // multi-gigabyte or endlessly chunked body must never make
+                // this process buffer past `max_body`, however large the
+                // operator's own cap is set.
+                let (text, truncated) =
+                    crate::fetch::read_capped_text(resp, max_body as usize).await;
+                body_bytes = text.len();
+                body = text;
+                body_truncated = truncated;
             }
 
             let title = body
@@ -215,6 +218,7 @@ impl Tool for HttpProbe {
                     "content_type": header_str("content-type"),
                     "content_length": header_str("content-length").and_then(|v| v.parse::<u64>().ok()),
                     "body_bytes": body_bytes,
+                    "body_truncated": body_truncated,
                     "title": title,
                     "security_headers_present": present_security,
                     "security_headers_missing": missing_security,

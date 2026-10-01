@@ -138,8 +138,11 @@ impl Tool for WafFingerprint {
                 }
             }
 
-            let body = resp.text().await.unwrap_or_default();
-            let body_head: String = body.chars().take(20_000).collect();
+            // Bounded at the network read itself - a block page is usually
+            // small, but nothing stops a hostile or compromised target from
+            // serving gigabytes in response to this request, and there is no
+            // rlimit on this process the way there is on a sandboxed child.
+            let (body_head, _truncated) = crate::fetch::read_capped_text(resp, 20_000).await;
             let body_l = body_head.to_ascii_lowercase();
             for (vendor, needle) in BODY_SIGNATURES {
                 if body_l.contains(needle) {

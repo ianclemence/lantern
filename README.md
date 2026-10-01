@@ -320,6 +320,7 @@ order is environment, then file, then preset.
 | `LANTERN_OPERATOR_ANSWER` | - | reply for `ask_operator` when no terminal is attached |
 | `LANTERN_OFFENSIVE` | `0` | same as `--offensive` |
 | `LANTERN_OFFLINE` | `0` | no external calls at all |
+| `LANTERN_USER_AGENT` | `lantern/<version>` | `User-Agent` for in-process target fetches - see [Detectability](#detectability-traces-and-the-agents-own-attack-surface) |
 | `LANTERN_TOKEN_BUDGET` | `6000` | context window budget per role |
 | `LANTERN_PRICE_INPUT_PER_MTOK` / `LANTERN_PRICE_OUTPUT_PER_MTOK` | - | USD per million tokens, so a run can print what it cost |
 | `LANTERN_ARTIFACT_DAYS` / `LANTERN_TRACE_DAYS` / `LANTERN_LOG_DAYS` | `7` / `14` / `30` | retention |
@@ -374,6 +375,59 @@ Storage rules, in order of preference:
 5. SQLite runs in WAL with `auto_vacuum=INCREMENTAL`, plus a conditional full
    `VACUUM` when free space drops under the threshold;
 6. findings are kept forever - they are the point of the exercise.
+
+## Detectability, traces, and the agent's own attack surface
+
+Questions worth asking of any pentest tool before it runs against something
+real, answered plainly rather than assumed:
+
+**Can the target detect it?** Partially, and by design rather than oversight
+on the recon side. `http_probe`, `waf_fingerprint`, `dir_bruteforce` and
+`web_search` send `User-Agent: lantern/<version>` by default - honest,
+self-identifying traffic, the same audit-first stance as everything else
+here (every command logged argv-for-argv; a target's own logs seeing what
+actually touched them is that same idea, not a gap). Override it with
+`LANTERN_USER_AGENT` for an engagement where blending into ordinary browser
+traffic is itself part of the test. What overriding it does **not** buy:
+`nikto` is a loud, signature-heavy scanner by its own design, `nmap`'s SYN/
+connect-scan timing is its own fingerprint, `sqlmap` already carries
+`--random-agent` as a separate setting, and none of that changes with a
+header. Nothing here claims stealth it cannot deliver.
+
+**Does it leave traces?** Yes, extensively, on the machine running it - this
+is the whole audit value proposition, not a flaw to route around. Every
+command (binary, full argv, exit code, duration, resolved IPs) lands in
+`lantern.db` and a JSONL trace file; artifacts and reports sit in plain
+files under the data root; the credential file is mode `0600` but its
+*path* is not hidden. Anyone with read access to the box - the operator,
+whoever administers it, a forensic review after the fact - can reconstruct
+exactly what ran, against what, and when. If "does it leave traces"
+means *on the target*, that is a question about the allowlisted tools
+themselves (`nmap`/`nikto`/`sqlmap` logs, WAF/IDS logs, access logs) - the
+same traces any of those tools would leave run by hand, not something this
+wrapper adds or removes.
+
+**Is the agent itself secure, or just a vulnerable pentester?** The things
+that would make it the latter: no shell anywhere (checked, see `exec.rs`);
+every child process gets `RLIMIT_AS`/`RLIMIT_CPU`/output caps independent of
+what the tool itself does; argument builders are hand-written per tool so
+the model can never smuggle a flag. The gap a thorough review has to ask
+about is the other direction - a hostile or compromised *target* attacking
+the agent back through its own response parsing. That gap existed until
+this session: `http_probe`, `waf_fingerprint`, `dir_bruteforce` and the
+search/CT-log lookups all buffered an HTTP response fully into memory
+(`reqwest`'s `.bytes()`/`.text()`) before any truncation applied, and none of
+that in-process code runs under the `RLIMIT_AS` that protects a sandboxed
+child - a target serving a multi-gigabyte or endlessly chunked response
+could force unbounded memory growth in the agent process itself. Every
+in-process network fetch is now bounded at the read itself
+(`fetch::read_capped_body`/`read_capped_text`, stops reading the instant the
+cap is hit rather than truncating after the fact), verified against a real
+oversized response in `fetch.rs`'s tests, not just reasoned about. The
+model's own text output is still bounded the way it always was (JSON parse
+with graceful fallback, `text_clip` everywhere a blob reaches a report or a
+prompt) - the fix was specifically the "read before truncate" class of bug,
+not a general audit of every parser.
 
 ## Memory
 

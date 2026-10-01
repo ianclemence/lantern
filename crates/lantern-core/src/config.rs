@@ -135,6 +135,20 @@ pub struct Config {
     pub keep_recent_tokens: usize,
     /// RAM allowance per concurrent task.
     pub ram_per_task_bytes: u64,
+    /// `User-Agent` every in-process HTTP fetch sends to a target
+    /// (`http_probe`, `waf_fingerprint`, `dir_bruteforce`, `web_search`).
+    /// Self-identifying by default - this is a deliberate reading of the
+    /// same audit-first stance as everything else here (every command is
+    /// logged argv-for-argv; a target's own logs seeing honest traffic is
+    /// the same idea, not an oversight), and it lets a defender's SOC
+    /// attribute the traffic in a detection-engineering engagement. Override
+    /// it for an engagement where blending into ordinary browser traffic is
+    /// itself part of what is being tested - but note what overriding this
+    /// does and does not buy: host-tool adapters like `nmap`/`nikto` are not
+    /// behaviourally stealthy regardless of any header (nikto in particular
+    /// is a loud, signature-heavy scanner by design; `sqlmap`'s own
+    /// `--random-agent` is a separate, already-enabled setting).
+    pub user_agent: String,
     pub llm: LlmConfig,
     pub embed: EmbedConfig,
 }
@@ -310,6 +324,8 @@ impl Config {
             summarize_at: env_usize("LANTERN_SUMMARIZE_AT", token_budget.saturating_sub(1_500)),
             keep_recent_tokens: env_usize("LANTERN_KEEP_RECENT_TOKENS", 1_500),
             ram_per_task_bytes,
+            user_agent: env_str("LANTERN_USER_AGENT")
+                .unwrap_or_else(|| format!("lantern/{}", env!("CARGO_PKG_VERSION"))),
             llm: LlmConfig {
                 provider: llm_provider,
                 base_url: llm_base.trim_end_matches('/').to_string(),
@@ -364,6 +380,18 @@ mod tests {
         assert!(c.allowlist.contains(&"nmap".to_string()));
         assert!(c.token_budget >= 2_000);
         assert!(c.paths.root.ends_with("lantern"));
+    }
+
+    #[test]
+    fn user_agent_is_self_identifying_by_default_and_overridable() {
+        std::env::remove_var("LANTERN_USER_AGENT");
+        let c = Config::load().unwrap();
+        assert!(c.user_agent.starts_with("lantern/"), "{}", c.user_agent);
+
+        std::env::set_var("LANTERN_USER_AGENT", "Mozilla/5.0 (compatible; engagement-123)");
+        let c = Config::load().unwrap();
+        std::env::remove_var("LANTERN_USER_AGENT");
+        assert_eq!(c.user_agent, "Mozilla/5.0 (compatible; engagement-123)");
     }
 
     #[test]

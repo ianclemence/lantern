@@ -100,7 +100,12 @@ impl Tool for SubdomainEnum {
                     "subdomain_enum: crt.sh returned HTTP {status}"
                 )));
             }
-            let body = resp.text().await.unwrap_or_default();
+            // crt.sh is a trusted third party, not the target itself, but
+            // still an external response this process must not buffer
+            // without bound - a heavily-certified domain can legitimately
+            // return a multi-megabyte response, so the cap here is generous
+            // (8 MB) rather than tight, but it is still a cap.
+            let (body, _truncated) = crate::fetch::read_capped_text(resp, 8 * 1024 * 1024).await;
 
             // crt.sh has, at times, emitted back-to-back JSON arrays rather
             // than one well-formed document under load; tolerate that by
