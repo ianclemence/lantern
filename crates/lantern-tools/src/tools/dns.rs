@@ -19,12 +19,36 @@ const RECORD_TYPES: &[(&str, RecordType)] = &[
     ("SOA", RecordType::SOA),
 ];
 
-fn build_resolver() -> anyhow::Result<Resolver<TokioConnectionProvider>> {
+pub(crate) fn build_resolver() -> anyhow::Result<Resolver<TokioConnectionProvider>> {
     Ok(Resolver::<TokioConnectionProvider>::builder_with_config(
         ResolverConfig::default(),
         TokioConnectionProvider::default(),
     )
     .build())
+}
+
+/// Resolve `host` to its A/AAAA addresses, bounded so a stalled or hostile
+/// resolver can never hang a flow. Returns `Ok(vec![])` rather than an error
+/// for NXDOMAIN/no-data — that is a normal outcome, not a failure — and only
+/// `Err` for a hard timeout or resolver construction failure. Used by host
+/// tools to pin down what address a hostname actually resolves to
+/// immediately before a command runs, so scope can be checked against the
+/// real target rather than trusting the name alone.
+pub(crate) async fn resolve_addresses(host: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    let resolver = build_resolver()?;
+    let lookup = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        resolver.lookup_ip(host),
+    )
+    .await;
+    match lookup {
+        Ok(Ok(ips)) => Ok(ips.iter().collect()),
+        Ok(Err(_)) => Ok(Vec::new()), // NXDOMAIN / no records: normal, not an error
+        Err(_) => anyhow::bail!("DNS resolution of `{host}` timed out"),
+    }
 }
 
 pub struct DnsLookup;

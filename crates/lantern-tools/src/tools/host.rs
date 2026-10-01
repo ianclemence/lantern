@@ -82,6 +82,37 @@ fn authority_of(url: &str) -> String {
         .to_string()
 }
 
+/// Does `s` look like a bare `ip/prefix` CIDR with nothing else attached?
+/// Used to route a target like msfconsole's `RHOSTS` straight into
+/// `Scope::allows`'s CIDR-subset check instead of through `authority_of`,
+/// which exists for URLs and would otherwise strip the `/prefix` as if it
+/// were a path.
+fn is_bare_cidr(s: &str) -> bool {
+    match s.split_once('/') {
+        Some((addr, prefix)) => {
+            !prefix.is_empty()
+                && !prefix.contains('/')
+                && prefix.chars().all(|c| c.is_ascii_digit())
+                && addr.parse::<std::net::IpAddr>().is_ok()
+        }
+        None => false,
+    }
+}
+
+/// What should actually be handed to `Scope::allows` for this raw `host`/`url`
+/// input. A bare CIDR (e.g. msfconsole's `RHOSTS`) is scope-checked as the
+/// whole range it names, so it is kept intact instead of being run through
+/// `authority_of`, which exists for URLs and would otherwise strip the
+/// `/prefix` the same way it strips a URL path — silently validating only the
+/// network's base address and letting a wider range than declared through.
+fn scope_target_of(target: &str) -> String {
+    if !target.contains("://") && is_bare_cidr(target) {
+        return target.to_string();
+    }
+    let auth = authority_of(target);
+    split_host_port(&auth).0
+}
+
 fn split_host_port(auth: &str) -> (String, Option<u16>) {
     if let Some(rest) = auth.strip_prefix('[') {
         // [v6]:port
@@ -603,6 +634,7 @@ impl HostTool {
                 timeout: self.timeout(),
                 max_output_bytes: ctx.config.max_output_bytes,
                 offensive: self.entry.offensive,
+                resolved_ips: &[],
             },
             ctx,
         )
@@ -621,6 +653,7 @@ impl HostTool {
                         timeout: Duration::from_secs(30),
                         max_output_bytes: ctx.config.max_output_bytes,
                         offensive: self.entry.offensive,
+                        resolved_ips: &[],
                     },
                     ctx,
                 )
@@ -848,14 +881,62 @@ impl Tool for HostTool {
                 .iter()
                 .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
                 .unwrap_or_default();
-            let auth = authority_of(target);
-            let (host, _port) = split_host_port(&auth);
-            if host.is_empty() {
+            if target.is_empty() {
                 anyhow::bail!("missing target for {}", self.entry.binary);
             }
-            ctx.check_scope(&host)?;
-            if !target.is_empty() && target.contains("://") {
-                ctx.check_scope(&auth)?;
+            let has_scheme = target.contains("://");
+            let scope_target = scope_target_of(target);
+            if scope_target.is_empty() {
+                anyhow::bail!("missing target for {}", self.entry.binary);
+            }
+            ctx.check_scope(&scope_target)?;
+            if has_scheme {
+                ctx.check_scope(&authority_of(target))?;
+            }
+
+            // Resolve DNS for a bare hostname right before executing, so the
+            // audit trail shows the address actually used rather than only
+            // the name the operator scoped, and — whenever the scope itself
+            // names concrete IP ranges, which is the configuration the README
+            // recommends — a hostname that now resolves outside those ranges
+            // is refused instead of silently scanned. This narrows, but
+            // cannot fully close, the gap between this check and the
+            // moment the host tool itself resolves the name: that binary
+            // does its own DNS lookup and nothing in user space can pin a
+            // third-party tool's connection to one address without breaking
+            // vhost-based tools (nikto, sqlmap) that need the name intact.
+            let mut resolved_ips: Vec<String> = Vec::new();
+            if scope_target.parse::<std::net::IpAddr>().is_err() && !scope_target.contains('/') {
+                match crate::tools::dns::resolve_addresses(&scope_target).await {
+                    Ok(ips) => {
+                        resolved_ips = ips.iter().map(|ip| ip.to_string()).collect();
+                        let scope_has_networks = ctx.scope.entries().iter().any(|e| {
+                            matches!(e, lantern_core::scope::ScopeEntry::Net { .. })
+                        });
+                        if scope_has_networks && !ips.is_empty() {
+                            let any_in_scope =
+                                ips.iter().any(|ip| ctx.scope.allows(&ip.to_string()));
+                            if !any_in_scope {
+                                anyhow::bail!(
+                                    "`{scope_target}` resolves to {} which --scope does not \
+                                     cover; DNS may have changed since the scope was declared \
+                                     — add the resolved address to --scope or re-check the \
+                                     target before running {}",
+                                    resolved_ips.join(", "),
+                                    self.entry.binary
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            host = %scope_target,
+                            error = %e,
+                            "DNS resolution before execution failed; proceeding on the \
+                             hostname-level scope check alone"
+                        );
+                    }
+                }
             }
 
             if self.entry.binary == "nuclei" && !ctx.config.nuclei_templates.is_dir() {
@@ -876,6 +957,7 @@ impl Tool for HostTool {
                     timeout: self.timeout(),
                     max_output_bytes: ctx.config.max_output_bytes,
                     offensive: self.entry.offensive,
+                    resolved_ips: &resolved_ips,
                 },
                 ctx,
             )
@@ -907,6 +989,7 @@ impl Tool for HostTool {
                 "bytes_out": outcome.bytes_out,
                 "duration_ms": outcome.duration_ms,
                 "output": lantern_core::text_clip(&outcome.combined(8_000), 6_000),
+                "resolved_ips": resolved_ips,
             });
 
             let full = format!(
@@ -999,6 +1082,69 @@ mod tests {
         assert!(t.build_args(&json!({"iface": "wlan0"}), &ctx).is_ok());
         assert!(t.build_args(&json!({"iface": "not; rm -rf /"}), &ctx).is_err());
         assert!(t.build_args(&json!({"iface": "doesnotexist0"}), &ctx).is_err());
+    }
+
+    #[test]
+    fn cidr_targets_are_kept_intact_for_the_scope_check() {
+        // A bare CIDR goes to Scope::allows whole, not stripped to its base
+        // address the way a URL path would be.
+        assert_eq!(scope_target_of("10.0.0.0/24"), "10.0.0.0/24");
+        assert_eq!(scope_target_of("10.0.0.5"), "10.0.0.5");
+        // A URL's path is still stripped as before.
+        assert_eq!(scope_target_of("https://example.com/a/b"), "example.com");
+        // Not a CIDR shape (host/path, or a non-digit "prefix"): falls back to
+        // authority stripping rather than being misread as a network.
+        assert_eq!(scope_target_of("example.com/admin"), "example.com");
+    }
+
+    #[test]
+    fn is_bare_cidr_rejects_non_cidr_shapes() {
+        assert!(is_bare_cidr("10.0.0.0/24"));
+        assert!(is_bare_cidr("::1/128"));
+        assert!(!is_bare_cidr("example.com/admin"));
+        assert!(!is_bare_cidr("10.0.0.0/24/x"));
+        assert!(!is_bare_cidr("10.0.0.5"));
+        assert!(!is_bare_cidr("not-an-ip/24"));
+    }
+
+    #[tokio::test]
+    async fn msfconsole_cannot_widen_a_cidr_scope_via_the_base_address() {
+        // End-to-end regression for the scope-bypass this patch closes: a
+        // scope of 10.0.0.0/24 must not let a model-supplied RHOSTS of
+        // 10.0.0.0/8 through just because the network's base address
+        // ("10.0.0.0") legitimately sits inside the declared /24.
+        let mut ctx = super::super::test_ctx();
+        ctx.scope = std::sync::Arc::new(
+            lantern_core::scope::Scope::parse("10.0.0.0/24").unwrap(),
+        );
+        let m = HostTool { entry: entry("msfconsole") };
+        let err = m
+            .execute(
+                json!({"module": "auxiliary/scanner/http/title", "host": "10.0.0.0/8"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("scope") || err.to_string().contains("out of"),
+            "expected a scope rejection, got: {err}"
+        );
+
+        // The equal /24 — exactly what was declared — must still be allowed
+        // through the scope gate (it may still fail later for lack of a real
+        // msfconsole binary in the test sandbox; that is a different error).
+        let ok_or_sandbox = m
+            .execute(
+                json!({"module": "auxiliary/scanner/http/title", "host": "10.0.0.0/24"}),
+                &ctx,
+            )
+            .await;
+        if let Err(e) = ok_or_sandbox {
+            assert!(
+                !e.to_string().to_lowercase().contains("scope"),
+                "an in-scope /24 must not be rejected as out of scope: {e}"
+            );
+        }
     }
 
     #[test]

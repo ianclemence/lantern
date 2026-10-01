@@ -276,8 +276,8 @@ impl Db {
             conn.execute(
                 "INSERT INTO commands
                  (flow_id, ts, tool, binary, args, cwd, exit_code, timed_out, truncated,
-                  bytes_out, duration_ms, stdout_path, stderr_path)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                  bytes_out, duration_ms, stdout_path, stderr_path, resolved_ips)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![
                     c.flow_id,
                     c.ts,
@@ -291,7 +291,8 @@ impl Db {
                     c.bytes_out,
                     c.duration_ms,
                     c.stdout_path,
-                    c.stderr_path
+                    c.stderr_path,
+                    serde_json::to_string(&c.resolved_ips).unwrap_or_else(|_| "[]".into()),
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -300,6 +301,7 @@ impl Db {
 
     fn command_from_row(r: &Row<'_>) -> rusqlite::Result<CommandRow> {
         let args: String = r.get(5)?;
+        let resolved_ips: Option<String> = r.get(14).unwrap_or(None);
         Ok(CommandRow {
             id: r.get(0)?,
             flow_id: r.get(1)?,
@@ -315,6 +317,10 @@ impl Db {
             duration_ms: r.get(11)?,
             stdout_path: r.get(12)?,
             stderr_path: r.get(13)?,
+            resolved_ips: resolved_ips
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default(),
         })
     }
 
@@ -322,7 +328,7 @@ impl Db {
         self.with(|c| {
             let mut st = c.prepare(
                 "SELECT id, flow_id, ts, tool, binary, args, cwd, exit_code, timed_out,
-                        truncated, bytes_out, duration_ms, stdout_path, stderr_path
+                        truncated, bytes_out, duration_ms, stdout_path, stderr_path, resolved_ips
                  FROM commands WHERE flow_id = ?1 ORDER BY id",
             )?;
             let rows = st.query_map(params![flow_id], Self::command_from_row)?;
@@ -794,6 +800,7 @@ mod tests {
                 duration_ms: 3,
                 stdout_path: None,
                 stderr_path: None,
+                resolved_ips: vec!["10.0.0.5".into()],
             })
             .unwrap();
         assert!(id > 0);
@@ -801,6 +808,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].args, vec!["--help"]);
         assert_eq!(rows[0].exit_code, Some(0));
+        assert_eq!(rows[0].resolved_ips, vec!["10.0.0.5".to_string()]);
     }
 
     #[test]

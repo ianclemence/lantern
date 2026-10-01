@@ -6,7 +6,7 @@
 //! - Embeddings live as little-endian f32 BLOBs; similarity is computed in Rust.
 //! - FTS5 gives keyword search; it degrades to `LIKE` if unavailable.
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -67,7 +67,14 @@ CREATE TABLE IF NOT EXISTS commands (
     bytes_out   INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     stdout_path TEXT,
-    stderr_path TEXT
+    stderr_path TEXT,
+    -- DNS A/AAAA records resolved for the target immediately before this
+    -- command ran, as a JSON string array. Lets a post-hoc review catch a
+    -- hostname that resolved to something other than what the operator
+    -- scoped (DNS drift / rebinding) between scope declaration and execution.
+    -- NULL for targets that were already IP literals or CIDR ranges, which
+    -- need no resolution.
+    resolved_ips TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_commands_flow ON commands(flow_id, ts);
 

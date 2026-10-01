@@ -430,6 +430,7 @@ async fn run_raw(
             timeout,
             max_output_bytes: ctx.config.max_output_bytes,
             offensive: false,
+            resolved_ips: &[],
         },
         ctx,
     )

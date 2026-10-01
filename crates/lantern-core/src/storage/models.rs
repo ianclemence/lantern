@@ -44,6 +44,12 @@ pub struct CommandRow {
     pub duration_ms: i64,
     pub stdout_path: Option<String>,
     pub stderr_path: Option<String>,
+    /// DNS A/AAAA records resolved for the target immediately before this
+    /// command ran (empty when the target was already an IP literal or CIDR,
+    /// or when resolution was not attempted). Lets a post-hoc review catch a
+    /// hostname that resolved differently than the operator expected when
+    /// they wrote `--scope`.
+    pub resolved_ips: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

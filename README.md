@@ -68,7 +68,15 @@ To be explicit about the boundaries, because they are deliberate:
 | Budgets | data root 1.28 GB, logs 200 MB, concurrency 3, token budget 6000 |
 
 `lantern doctor` re-measures all of this at runtime and prints the numbers it
-actually sees.
+actually sees. The figures above are what this profile measures on the
+reference 4-core/8 GiB device; they are not hardcoded. `concurrency` and the
+per-child memory rlimit (`LANTERN_CHILD_MEM_MB`) are derived from whatever
+host `lantern` actually runs on - `DeviceProfile::detect` reads the live core
+count, RAM and swap and sizes both from that, so the same binary lands on
+`concurrency=3`/`512 MB` on this reference device, scales down toward 1
+task/256 MB on something smaller, and scales up on a bigger box, all without
+a rebuild. An explicit `LANTERN_CONCURRENCY` or `LANTERN_CHILD_MEM_MB` still
+overrides the derived value, same as every other setting in this table.
 
 ## Build
 
@@ -227,6 +235,34 @@ flow working directory; `nuclei` runs with `-no-interactsh` so no callback ever
 leaves for a third party. `tcpdump` alone holds `cap_net_raw,cap_net_admin`;
 the `lantern` binary stays unprivileged.
 
+### Scope: CIDR and DNS
+
+A target can be a host name, an IP, or a CIDR range, and the scope check
+treats each correctly rather than as interchangeable strings:
+
+- **A CIDR target (e.g. `msfconsole`'s `RHOSTS`) is checked as the whole
+  range it names**, not just its base address. A scope of `10.0.0.0/24`
+  rejects a target of `10.0.0.0/8` even though `10.0.0.0` itself sits inside
+  the declared range - the target's own prefix must be at least as narrow as
+  the scope entry's, so nothing can request a broader sweep than was
+  authorised by naming a wider mask over the same network address.
+- **A host-name target is resolved immediately before the command runs**,
+  and the resolved address is written to the audit row (`resolved_ips`,
+  visible in `lantern report` and the trace file) regardless of outcome. When
+  `--scope` itself names one or more IP ranges - the configuration this
+  README recommends - a hostname that now resolves outside every one of them
+  is refused instead of silently scanned, catching DNS drift or rebinding
+  between the moment the scope was declared and the moment a tool actually
+  runs. A scope defined purely by host name (no IP/CIDR entries at all) skips
+  this extra check, since there is nothing to compare the resolved address
+  against.
+- This narrows, but cannot fully close, the gap between Lantern's check and
+  the host tool's own connection: `nmap`/`nikto`/`sqlmap` do their own DNS
+  resolution internally, and nothing in user space can pin a third-party
+  binary to one resolved address without breaking vhost-based tools that
+  need the host name intact for the `Host`/SNI value. Put the resolved IP in
+  `--scope` alongside the host name for the tightest guarantee.
+
 ## Environment variables
 
 Every value has a default, so nothing here is required. Underneath the
@@ -249,10 +285,10 @@ order is environment, then file, then preset.
 | `LANTERN_DATA_CAP_MB` | `1280` | hard cap on the data root |
 | `LANTERN_LOG_CAP_MB` | `200` | cap on the log directory |
 | `LANTERN_DISK_FLOOR_PERCENT` | `20` | free space `lantern setup` will not cross |
-| `LANTERN_CONCURRENCY` | `3` | parallel task budget |
+| `LANTERN_CONCURRENCY` | device-derived (`3` on the reference device) | parallel task budget |
 | `LANTERN_TASK_TIMEOUT_SECS` | `120` | per-task wall clock |
 | `LANTERN_MAX_OUTPUT_BYTES` | `2097152` | max captured output per command |
-| `LANTERN_CHILD_MEM_MB` / `LANTERN_CHILD_CPU_SECS` | `512` / `60` | child rlimits |
+| `LANTERN_CHILD_MEM_MB` / `LANTERN_CHILD_CPU_SECS` | device-derived (`512`) / `60` | child rlimits |
 | `LANTERN_PATH` | `/usr/local/bin:/usr/bin:/bin` + tools dirs | restricted `PATH` for children |
 | `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john,bwrap` | host binaries that may run |
 | `LANTERN_TOOLS_DIR` | `~/.local/share/lantern-tools` | where `lantern setup` provisions tools |

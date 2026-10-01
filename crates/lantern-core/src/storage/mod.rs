@@ -37,9 +37,29 @@ impl Db {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < schema::SCHEMA_VERSION {
+            // `CREATE TABLE IF NOT EXISTS` in the DDL is a no-op against a table
+            // that already exists from an earlier schema version, so a column
+            // added since then needs an explicit, individually-guarded
+            // migration — never a blind re-run of the DDL.
+            if version >= 1 && version < 2 {
+                // Column may already be present on a database that was created
+                // fresh at version 2 and then, through some upgrade path,
+                // re-entered this branch; ALTER TABLE has no `IF NOT EXISTS`
+                // for columns, so tolerate "duplicate column name".
+                if let Err(e) = conn.execute_batch("ALTER TABLE commands ADD COLUMN resolved_ips TEXT;")
+                {
+                    if !e.to_string().contains("duplicate column name") {
+                        return Err(e.into());
+                    }
+                }
+            }
             conn.execute_batch(schema::DDL)?;
             conn.execute_batch(&format!("PRAGMA user_version={}", schema::SCHEMA_VERSION))?;
-            tracing::info!(version = schema::SCHEMA_VERSION, "database schema initialized");
+            tracing::info!(
+                from = version,
+                to = schema::SCHEMA_VERSION,
+                "database schema migrated"
+            );
         }
 
         Ok(Self {
