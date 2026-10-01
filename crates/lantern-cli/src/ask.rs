@@ -159,6 +159,13 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
             names.join(", ")
         );
     }
+    if parsed.engagement_profile != intent::EngagementProfile::General {
+        println!(
+            "profile     : {:?} (shapes the system prompt's taxonomy and honesty \
+             boundary, not tool access or scope)",
+            parsed.engagement_profile
+        );
+    }
     let step_boosts = parsed.step_boosts();
     if !step_boosts.is_empty() {
         let parts: Vec<String> = step_boosts
@@ -181,6 +188,7 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
         .roles(roles);
     opts.max_steps = args.steps;
     opts.extra_steps = step_boosts;
+    opts.engagement_profile = parsed.engagement_profile;
     opts.directive = Some(prompt);
 
     if args.interactive {

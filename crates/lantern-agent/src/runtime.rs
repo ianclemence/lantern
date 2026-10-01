@@ -51,6 +51,11 @@ pub struct FlowOptions {
     /// static default, unlike `max_steps`, which only ever lowers it; an
     /// explicit `max_steps` still wins as the hard ceiling over both.
     pub extra_steps: Vec<(RoleId, usize)>,
+    /// What kind of engagement the operator's own instruction sounds like -
+    /// see `intent::Intent::engagement_profile` and
+    /// `prompts::engagement_addendum`. `General` (the default) changes
+    /// nothing about the system prompt a plain `lantern run` gets.
+    pub engagement_profile: crate::intent::EngagementProfile,
     /// Roles may stop and ask the operator a question (`ask_operator`).
     pub interactive: bool,
     /// The operator's own instruction, verbatim (`lantern ask`). Stored with
@@ -78,6 +83,7 @@ impl std::fmt::Debug for FlowOptions {
             .field("roles", &self.roles)
             .field("max_steps", &self.max_steps)
             .field("extra_steps", &self.extra_steps)
+            .field("engagement_profile", &self.engagement_profile)
             .field("interactive", &self.interactive)
             .field(
                 "directive",
@@ -112,6 +118,7 @@ impl FlowOptions {
             roles: Vec::new(),
             max_steps: None,
             extra_steps: Vec::new(),
+            engagement_profile: crate::intent::EngagementProfile::default(),
             interactive: false,
             directive: None,
             progress: None,
@@ -623,7 +630,13 @@ async fn role_loop(
     opts: &FlowOptions,
 ) -> anyhow::Result<(String, usize)> {
     let meta = role(id);
-    let system = prompts::system(meta, target, scope, tool_ctx.offensive);
+    let system = prompts::system(
+        meta,
+        target,
+        scope,
+        tool_ctx.offensive,
+        opts.engagement_profile,
+    );
     let mut window = ContextWindow::new(
         agent.config.token_budget,
         agent.config.summarize_at,
@@ -642,8 +655,16 @@ async fn role_loop(
         // Steering typed mid-flow joins the working set at the next boundary,
         // so the roles still to run act on it.
         if let Some(queue) = &opts.steering {
-            let mut queued = queue.lock().unwrap_or_else(|e| e.into_inner());
-            for line in queued.drain(..) {
+            // Drain into a local Vec and drop the lock before the first
+            // `.await`: holding a std::sync::Mutex guard across an await
+            // point blocks whoever next tries to lock it (chat's UI thread
+            // pushing a newly typed steering line) for the duration of a
+            // model/network call rather than a pointer swap.
+            let lines: Vec<String> = {
+                let mut queued = queue.lock().unwrap_or_else(|e| e.into_inner());
+                queued.drain(..).collect()
+            };
+            for line in lines {
                 memory.remember("operator", &line).await;
                 window.push(Message::user(format!("OPERATOR (live steering): {line}")));
             }

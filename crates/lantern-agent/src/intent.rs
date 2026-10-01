@@ -82,6 +82,105 @@ impl Contract {
     }
 }
 
+/// Which kind of engagement the prompt's vocabulary sounds like. Feeds
+/// `prompts::system`'s addendum, not tool access or scope - it only changes
+/// how the role is told to think and what taxonomy to report against, never
+/// what it is allowed to touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngagementProfile {
+    /// No strong signal either way: the generic framing applies.
+    #[default]
+    General,
+    WebApp,
+    Api,
+    InternalAd,
+    Cloud,
+    NetworkInfra,
+}
+
+/// (keyword, profile) pairs. Independent of `ROLE_SIGNALS`: a role hint says
+/// *who* should pay attention, a profile says *what kind of engagement this
+/// is* so the system prompt can name the right taxonomy and the right
+/// honesty boundary (what this toolset cannot actually check for that
+/// profile) instead of the same generic framing for every engagement.
+const PROFILE_SIGNALS: &[(&str, EngagementProfile)] = &[
+    // Web application.
+    ("web application", EngagementProfile::WebApp),
+    ("web app", EngagementProfile::WebApp),
+    ("xss", EngagementProfile::WebApp),
+    ("csrf", EngagementProfile::WebApp),
+    ("sql injection", EngagementProfile::WebApp),
+    ("sqlmap", EngagementProfile::WebApp),
+    ("login form", EngagementProfile::WebApp),
+    ("session cookie", EngagementProfile::WebApp),
+    ("idor", EngagementProfile::WebApp),
+    ("file upload", EngagementProfile::WebApp),
+    ("broken access control", EngagementProfile::WebApp),
+    // API.
+    ("api security", EngagementProfile::Api),
+    ("rest api", EngagementProfile::Api),
+    ("graphql", EngagementProfile::Api),
+    ("openapi", EngagementProfile::Api),
+    ("swagger", EngagementProfile::Api),
+    ("jwt", EngagementProfile::Api),
+    ("oauth", EngagementProfile::Api),
+    ("saml", EngagementProfile::Api),
+    ("mass assignment", EngagementProfile::Api),
+    ("bola", EngagementProfile::Api),
+    ("bfla", EngagementProfile::Api),
+    // Internal / Active Directory.
+    ("active directory", EngagementProfile::InternalAd),
+    ("domain controller", EngagementProfile::InternalAd),
+    ("kerberoast", EngagementProfile::InternalAd),
+    ("ntlm", EngagementProfile::InternalAd),
+    ("lateral movement", EngagementProfile::InternalAd),
+    ("golden ticket", EngagementProfile::InternalAd),
+    ("ldap", EngagementProfile::InternalAd),
+    ("domain admin", EngagementProfile::InternalAd),
+    ("internal network assessment", EngagementProfile::InternalAd),
+    ("ad environment", EngagementProfile::InternalAd),
+    // Cloud posture.
+    ("s3 bucket", EngagementProfile::Cloud),
+    ("iam policy", EngagementProfile::Cloud),
+    ("iam role", EngagementProfile::Cloud),
+    ("instance metadata", EngagementProfile::Cloud),
+    ("metadata service", EngagementProfile::Cloud),
+    ("cloud storage", EngagementProfile::Cloud),
+    ("aws account", EngagementProfile::Cloud),
+    ("azure ad", EngagementProfile::Cloud),
+    ("gcp project", EngagementProfile::Cloud),
+    ("cloud misconfiguration", EngagementProfile::Cloud),
+    // Network infrastructure.
+    ("network segmentation", EngagementProfile::NetworkInfra),
+    ("firewall rule", EngagementProfile::NetworkInfra),
+    ("port scan", EngagementProfile::NetworkInfra),
+    ("internal network", EngagementProfile::NetworkInfra),
+    ("vpn gateway", EngagementProfile::NetworkInfra),
+];
+
+/// The profile whose vocabulary matched the most keywords; `General` when
+/// nothing scored above zero. Ties go to whichever profile is declared last
+/// among the tied entries in `PROFILE_SIGNALS` (the order above, read
+/// top to bottom) - deterministic, and covered by
+/// `tie_breaks_to_the_later_declared_profile` below so a reader never has to
+/// take that on faith.
+fn detect_profile(lower: &str) -> EngagementProfile {
+    let mut counts: Vec<(EngagementProfile, usize)> = Vec::new();
+    for (kw, profile) in PROFILE_SIGNALS {
+        if lower.contains(kw) {
+            match counts.iter_mut().find(|(p, _)| p == profile) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((*profile, 1)),
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(p, _)| p)
+        .unwrap_or(EngagementProfile::General)
+}
+
 /// What a prompt asks for, as far as a flow can tell without a model.
 #[derive(Debug, Clone, Default)]
 pub struct Intent {
@@ -105,6 +204,10 @@ pub struct Intent {
     /// actual larger step budget, so a rich prompt gets more room to work
     /// without the operator having to compute and pass `--steps` by hand.
     pub role_weight: Vec<(RoleId, usize)>,
+    /// What kind of engagement the prompt's vocabulary sounds like. Feeds
+    /// `prompts::system`'s addendum; `General` (the default) changes nothing
+    /// about the prompt a plain `lantern run` or a short instruction gets.
+    pub engagement_profile: EngagementProfile,
 }
 
 /// A role's step budget is never raised by more than this many steps from
@@ -366,6 +469,7 @@ pub fn parse_intent(text: &str) -> Intent {
     // Pipeline order, so a hint never reorders the cast.
     intent.roles_hint.sort_by_key(|r| *r as usize);
     intent.role_weight.sort_by_key(|(r, _)| *r as usize);
+    intent.engagement_profile = detect_profile(&lower);
     intent
 }
 
@@ -562,6 +666,46 @@ mod tests {
                 "expected pentester hint for: {text}"
             );
         }
+    }
+
+    #[test]
+    fn engagement_profile_defaults_to_general() {
+        assert_eq!(parse_intent("check DNS").engagement_profile, EngagementProfile::General);
+        assert_eq!(
+            parse_intent("Coverage: authentication, privilege escalation, severity")
+                .engagement_profile,
+            EngagementProfile::General,
+            "a single stray mention of adjacent territory should not flip the profile"
+        );
+    }
+
+    #[test]
+    fn engagement_profile_detects_each_category() {
+        let cases = [
+            ("Look for XSS and CSRF on the login form session cookies", EngagementProfile::WebApp),
+            ("Test the GraphQL API, check JWT and OAuth handling", EngagementProfile::Api),
+            (
+                "Kerberoast the domain controllers and check for NTLM relay, active directory",
+                EngagementProfile::InternalAd,
+            ),
+            ("Audit S3 bucket ACLs and IAM policy/IAM role trust", EngagementProfile::Cloud),
+            (
+                "Review network segmentation, firewall rules and port scan the internal network",
+                EngagementProfile::NetworkInfra,
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(parse_intent(text).engagement_profile, want, "text: {text}");
+        }
+    }
+
+    #[test]
+    fn tie_breaks_to_the_later_declared_profile() {
+        // "web app" (WebApp) and "api security" (Api) are declared one match
+        // each here; Vec::max_by_key keeps the later-seen entry on a tie, and
+        // Api is declared after WebApp in PROFILE_SIGNALS.
+        let i = parse_intent("Assess this web app and its api security surface");
+        assert_eq!(i.engagement_profile, EngagementProfile::Api);
     }
 
     #[test]

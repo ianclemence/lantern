@@ -73,12 +73,26 @@ struct Composer {
     saved: String,
 }
 
+/// Largest byte index `<= i` that lands on a `char` boundary of `s`.
+/// Equivalent to the standard library's `str::floor_char_boundary`, which
+/// stabilized in Rust 1.91 - after this project's declared MSRV of 1.85
+/// (`Cargo.toml`, README). Reimplemented here rather than relying on a
+/// toolchain newer than the one the project claims to support; `0` is
+/// always a boundary, so the loop terminates.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut j = i;
+    while j > 0 && !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
 impl Composer {
     fn floor(&mut self) {
-        self.cursor = self
-            .text
-            .floor_char_boundary(self.cursor)
-            .min(self.text.len());
+        self.cursor = floor_char_boundary(&self.text, self.cursor).min(self.text.len());
     }
 
     fn insert(&mut self, s: &str) {
@@ -194,10 +208,7 @@ impl Composer {
 
     /// Display width of the text before the cursor (for cursor placement).
     fn cursor_width(&self) -> usize {
-        let end = self
-            .text
-            .floor_char_boundary(self.cursor)
-            .min(self.text.len());
+        let end = floor_char_boundary(&self.text, self.cursor).min(self.text.len());
         UnicodeWidthStr::width(&self.text[..end])
     }
 }
@@ -623,6 +634,7 @@ fn start_flow(
         .roles(roles);
     opts.max_steps = ui.session.steps;
     opts.extra_steps = parsed.step_boosts();
+    opts.engagement_profile = parsed.engagement_profile;
     opts.directive = Some(instruction.to_string());
 
     let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -940,7 +952,7 @@ fn ui_loop(config: Config, session: Session, model: String) -> anyhow::Result<()
                     let cmd = &COMMANDS[picked];
                     // Compose-first when arguments are missing: running a
                     // command that needs them would only print usage.
-                    let typed_args = query.split_whitespace().skip(1).next().is_some()
+                    let typed_args = query.split_whitespace().nth(1).is_some()
                         || ui.composer.text.contains(' ');
                     if cmd.needs_args && !typed_args {
                         ui.composer.text = format!("/{name} ", name = cmd.name);
@@ -1058,6 +1070,9 @@ fn submit_instruction(
         "as instructed"
     };
     say(terminal, &[format!("intent: {intent_line}")])?;
+    if parsed.engagement_profile != intent::EngagementProfile::General {
+        say(terminal, &[format!("profile: {:?}", parsed.engagement_profile)])?;
+    }
     if let Some(w) = crate::ask::target_warning(
         ui.session.target.as_deref().unwrap_or(""),
         &parsed.contract.target_list(),
@@ -1070,7 +1085,12 @@ fn submit_instruction(
     // a note, exactly like `ask`.
     let asks_active = parsed.wants_offensive && !parsed.defensive_only;
     if gate_warning.is_some() && asks_active && !ui.session.offensive {
-        ui.approval = Some((0, PendingFlow { instruction: line }));
+        // Default the highlight to [2] deny, not [1] allow: the module doc
+        // already calls Esc "deny-by-inaction", and a card that pre-selects
+        // the active-testing option means a reflexive Enter - the same key
+        // that submits every other line in this UI - grants it. Reaching
+        // "allow" now takes a deliberate Left/Right or typing `1`.
+        ui.approval = Some((1, PendingFlow { instruction: line }));
         return Ok(());
     }
     if let Some(w) = gate_warning {
@@ -1131,6 +1151,29 @@ mod tests {
         assert!(palette_matches("zzz").is_empty());
         // Fully typed "/quit" runs quit even with the highlight elsewhere.
         assert_eq!(COMMANDS[palette_pick(&all, "/quit", 7)].name, "quit");
+    }
+
+    #[test]
+    fn floor_char_boundary_matches_the_std_semantics_it_replaces() {
+        let s = "héllo"; // 'é' is 2 bytes, so byte 2 sits mid-character
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 1); // boundary after 'h'
+        assert_eq!(floor_char_boundary(s, 2), 1); // mid-'é': floors to before it
+        assert_eq!(floor_char_boundary(s, 3), 3); // boundary after 'é'
+        assert_eq!(floor_char_boundary(s, 100), s.len(), "past the end clamps to len");
+        assert_eq!(floor_char_boundary("", 0), 0);
+    }
+
+    #[test]
+    fn approval_card_defaults_to_deny_not_allow() {
+        // A reflexive Enter on a freshly raised approval card - the same key
+        // that submits every other line in this UI - must never grant active
+        // testing. Explicit Left (or typing 1) is what reaches "allow".
+        let mut sel = 1usize; // the default this card is raised with
+        assert_eq!(approval_key(&KeyCode::Enter, &mut sel), Some(false));
+        assert_eq!(approval_key(&KeyCode::Left, &mut sel), None);
+        assert_eq!(sel, 0);
+        assert_eq!(approval_key(&KeyCode::Enter, &mut sel), Some(true));
     }
 
     #[test]

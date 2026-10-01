@@ -202,6 +202,19 @@ longer framework is what earns the extra steps, capped so repeating a
 keyword cannot buy an unbounded budget. An explicit `--steps` is still the
 hard ceiling over all of it.
 
+A prompt also shapes *how the model is told to think*, through an
+engagement profile detected from the same vocabulary (web app / API /
+internal-AD / cloud / network - `profile : ...` in the intent card when one
+is detected). Each profile adds a short, specific addendum to the system
+prompt: which taxonomy to structure findings against (OWASP, MITRE ATT&CK,
+CIS - whatever that engagement type's own field uses), and - just as
+important - which checks this build cannot actually run for that profile, so
+the model says "I don't have a tool for that" instead of describing a
+GraphQL or IAM-policy check it never performed. A short instruction with no
+strong signal (most of them) gets the same generic framing this always had -
+the addendum is empty, byte for byte, unless the vocabulary actually points
+somewhere specific.
+
 `chat` is the same flow behind a conversational screen: the transcript stays
 in the terminal's scrollback while a small viewport shows status, live role
 and tool activity, and the input line. `/target`, `/scope`, `/roles`,

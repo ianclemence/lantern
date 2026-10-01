@@ -31,7 +31,13 @@ fn the_fixed_overhead_of_a_call_stays_small() {
     let scope = "example.com, 104.20.23.154/32, 172.66.147.243/32";
     let mut worst = 0usize;
     for r in roles() {
-        let system = prompts::system(r, "example.com", scope, false);
+        let system = prompts::system(
+            r,
+            "example.com",
+            scope,
+            false,
+            lantern_agent::intent::EngagementProfile::General,
+        );
         let overhead = schema + (system.len() + 3) / 4;
         worst = worst.max(overhead);
         println!(
