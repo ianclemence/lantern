@@ -644,7 +644,14 @@ async fn role_loop(
     );
     window.push(Message::user(objective));
 
-    let defs = agent.registry.defs();
+    // Scoped to this role's own focus: every role already pays this cost on
+    // every request, and `meta.focus` is exactly what the system prompt's
+    // `YOUR TOOLS:` line already told the model it may use - sending schemas
+    // for everything else is pure overhead that only grows as the registry
+    // does. A role with no declared focus (there are none on the tool-calling
+    // path today) falls back to the full registry rather than silently
+    // seeing nothing.
+    let defs = agent.registry.defs_for(meta.focus);
     let mut text = String::new();
     let mut steps = 0usize;
 

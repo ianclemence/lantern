@@ -185,29 +185,42 @@ never competes with logs, artifacts and findings for space.
 |---|---|---|
 | orchestrator | turns the objective into a written plan | - |
 | planner | reorders the plan by risk and effort | - |
-| researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, subdomains, web search | `dns_lookup`, `subdomain_enum`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
-| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `code_run` |
-| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
+| researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, subdomains, WAF/CDN, leaked secrets, web search | `dns_lookup`, `subdomain_enum`, `tls_inspect`, `http_probe`, `waf_fingerprint`, `secret_scan`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
+| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `code_run`, `secret_scan` |
+| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_testssl`, `host_gobuster`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `host_amass`\*, `waf_fingerprint`, `secret_scan`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
 | reflector | reviews the evidence quality and confidence of every finding | `memory_search`, `ask_operator`, `plan_patch` |
 
 \* requires `--offensive`.
 
 Every tool call passes through one choke point
 (`Registry::execute`), which applies the scope check and the `--offensive`
-gate *before* the tool body runs.
+gate *before* the tool body runs. Each role's own tool-calling loop only ever
+*sees* (and pays context budget for) the schemas of the tools in its own
+`Tools` column above (`Registry::defs_for`) - not the whole registry - so
+`YOUR TOOLS:` in the system prompt is an enforced fact about what the model
+can even call, not just a steering hint, and the registry can keep growing
+without inflating every role's fixed per-request overhead.
 
 ### Tools
 
 In-process (no child process): `port_scan`, `dns_lookup`, `subdomain_enum`
 (certificate-transparency lookup via crt.sh - passive, touches no target
 infrastructure; candidates are labelled in/out of scope, never auto-added to
-it), `http_probe`, `tls_inspect`, `whois`, `dir_bruteforce` (built-in 2,419-entry wordlist),
-`web_search` (DuckDuckGo HTML by default, a search API if you configure one;
-`mode: vulnerability` puts matching NVD CVEs and their CVSS scores first),
-`memory_search`, `memory_store`, `ask_operator` (only under `--interactive`,
-and silent unless you set `LANTERN_OPERATOR_ANSWER`), `plan_patch` (roles
-correct the plan once facts disagree with it, and later roles read the
-corrected version).
+it), `http_probe`, `tls_inspect`, `waf_fingerprint` (CDN/WAF signature match
+from one ordinary response - headers, cookies, a block page's own
+self-identification; no payloads, same risk tier as `http_probe` - run this
+before trusting a zero-finding `sqlmap`/`nuclei` scan, since a silent WAF
+block looks identical to a clean application in that tool's own output),
+`secret_scan` (regex match for credential-shaped strings - AWS/GCP/Stripe/
+Slack/GitHub/Twilio/SendGrid keys, JWTs, private key blocks - in text another
+tool already captured; no network or file access of its own, and every match
+is reported masked, never the live value), `whois`, `dir_bruteforce`
+(built-in 2,419-entry wordlist), `web_search` (DuckDuckGo HTML by default, a
+search API if you configure one; `mode: vulnerability` puts matching NVD
+CVEs and their CVSS scores first), `memory_search`, `memory_store`,
+`ask_operator` (only under `--interactive`, and silent unless you set
+`LANTERN_OPERATOR_ANSWER`), `plan_patch` (roles correct the plan once facts
+disagree with it, and later roles read the corrected version).
 
 One child process, and it is not a host binary: `code_run` - a single
 Python script (standard library only, nothing else the model can name)
@@ -222,11 +235,14 @@ Allowlisted host binaries, all provisioned by `lantern setup`:
 | `nmap` | connect scan, ports and services | scope |
 | `nikto` | web-server misconfiguration scan | scope |
 | `tcpdump` | capture N packets to a pcap artifact | scope |
+| `testssl.sh` | deep TLS/cipher inspection (protocol downgrade, Heartbleed-class checks) | scope |
+| `gobuster` | faster, multi-threaded directory/file discovery than `dir_bruteforce` | scope |
 | `sqlmap` | SQL-injection testing against a URL | `--offensive` + scope |
 | `hydra` | password spraying against one service | `--offensive` + scope |
 | `nuclei` | CVE template scan of a URL, JSONL findings | `--offensive` + scope |
 | `msfconsole` | one module (`use`/`set`/`run` or `check`), built as a single argv element | `--offensive` + scope |
 | `john` | offline cracking: wordlist, optional rules, then `--show` | `--offensive` |
+| `amass` | active subdomain enumeration (active DNS resolution, optional `-brute`) | `--offensive` + scope |
 
 Each adapter builds its own argument array - the model never supplies raw
 flags, so it cannot smuggle `-oN /etc/passwd` through. The `msfconsole`
@@ -234,8 +250,14 @@ session string is assembled from a validated module path and character-filtered
 option values, so no option can chain a second console command; `john` writes
 its hashes into the flow's own artifact directory and keeps its pot file in the
 flow working directory; `nuclei` runs with `-no-interactsh` so no callback ever
-leaves for a third party. `tcpdump` alone holds `cap_net_raw,cap_net_admin`;
-the `lantern` binary stays unprivileged.
+leaves for a third party; `gobuster` falls back to the same bundled wordlist
+`dir_bruteforce` uses, materialised into the flow's own artifact directory,
+when no custom one is given. `tcpdump` alone holds `cap_net_raw,cap_net_admin`;
+the `lantern` binary stays unprivileged. `testssl.sh` is a shell script with
+no compiled binary of its own - the kernel's shebang handling runs it via
+`execve`, exactly like `python3 script.py` in `code_run`; there is no shell
+string interpolation of operator input anywhere in that path, same as every
+other adapter.
 
 ### Scope: CIDR and DNS
 
@@ -292,7 +314,7 @@ order is environment, then file, then preset.
 | `LANTERN_MAX_OUTPUT_BYTES` | `2097152` | max captured output per command |
 | `LANTERN_CHILD_MEM_MB` / `LANTERN_CHILD_CPU_SECS` | device-derived (`512`) / `60` | child rlimits |
 | `LANTERN_PATH` | `/usr/local/bin:/usr/bin:/bin` + tools dirs | restricted `PATH` for children |
-| `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john,bwrap` | host binaries that may run |
+| `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john,bwrap,testssl.sh,gobuster,amass` | host binaries that may run |
 | `LANTERN_TOOLS_DIR` | `~/.local/share/lantern-tools` | where `lantern setup` provisions tools |
 | `LANTERN_NUCLEI_TEMPLATES` | `<tools-dir>/share/nuclei-templates` | template set for `host_nuclei` |
 | `LANTERN_OPERATOR_ANSWER` | - | reply for `ask_operator` when no terminal is attached |

@@ -203,6 +203,9 @@ fn default_allowlist() -> Vec<String> {
         "msfconsole",
         "john",
         "bwrap",
+        "testssl.sh",
+        "gobuster",
+        "amass",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -371,7 +374,7 @@ mod tests {
             a,
             vec![
                 "nmap", "sqlmap", "nikto", "hydra", "tcpdump", "nuclei", "msfconsole", "john",
-                "bwrap"
+                "bwrap", "testssl.sh", "gobuster", "amass"
             ]
         );
         assert!(a.iter().all(|b| !b.contains('/') && !b.contains(' ')));

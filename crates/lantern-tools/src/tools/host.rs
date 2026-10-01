@@ -31,6 +31,21 @@ pub fn host_tools() -> Vec<HostToolEntry> {
             default_args: vec![],
         },
         HostToolEntry {
+            binary: "testssl.sh",
+            description: "Deep TLS/SSL inspection of an in-scope host: protocol versions, \
+                           cipher strength, known vulnerabilities (Heartbleed-class checks). \
+                           Passive protocol negotiation, not exploitation.",
+            offensive: false,
+            default_args: vec![],
+        },
+        HostToolEntry {
+            binary: "gobuster",
+            description: "Faster, multi-threaded directory/file discovery against an \
+                           in-scope URL than dir_bruteforce - same risk tier as nikto.",
+            offensive: false,
+            default_args: vec![],
+        },
+        HostToolEntry {
             binary: "tcpdump",
             description: "Capture N packets on an in-scope interface to a pcap artifact (needs CAP_NET_RAW).",
             offensive: false,
@@ -51,6 +66,15 @@ pub fn host_tools() -> Vec<HostToolEntry> {
         HostToolEntry {
             binary: "nuclei",
             description: "ACTIVE: nuclei CVE template scan of an in-scope URL (local template set). Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
+        HostToolEntry {
+            binary: "amass",
+            description: "ACTIVE: amass subdomain enumeration against an in-scope domain - \
+                           active DNS resolution and optional brute-forcing, generating real \
+                           traffic against the target's and third parties' DNS infrastructure, \
+                           unlike the passive subdomain_enum (crt.sh) tool. Requires --offensive.",
             offensive: true,
             default_args: vec![],
         },
@@ -408,6 +432,105 @@ impl HostTool {
                 script.push_str(&format!("{action}; exit"));
                 Ok(vec!["-q".into(), "-x".into(), script])
             }
+            "testssl.sh" => {
+                let host = super::str_field(input, "host")?;
+                let target = if let Some(port) = input.get("port").and_then(|v| v.as_u64()) {
+                    if port == 0 || port > 65_535 {
+                        anyhow::bail!("invalid port");
+                    }
+                    format!("{host}:{port}")
+                } else {
+                    host
+                };
+                Ok(vec![
+                    "--quiet".into(),
+                    "--color".into(),
+                    "0".into(),
+                    // Non-interactive: a warning (e.g. an old OpenSSL build)
+                    // must never block an automated run waiting on a
+                    // keypress nobody is there to give.
+                    "--warnings".into(),
+                    "batch".into(),
+                    target,
+                ])
+            }
+            "gobuster" => {
+                let url = super::str_field(input, "url")?;
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    anyhow::bail!("gobuster needs an http(s) url");
+                }
+                if url.len() > 2_048 {
+                    anyhow::bail!("url too long");
+                }
+                let wordlist_path = match super::opt_str_field(input, "wordlist") {
+                    Some(p) => {
+                        let path = std::path::PathBuf::from(&p);
+                        crate::ctx::require_input_file(&path)?;
+                        if !path.starts_with(&ctx.config.tools_dir)
+                            && !path.starts_with(&ctx.config.paths.root)
+                        {
+                            anyhow::bail!("wordlist must live under the tools dir or the data root");
+                        }
+                        path
+                    }
+                    // No custom wordlist: materialise the same built-in list
+                    // dir_bruteforce already ships, so there is always a
+                    // working default and no extra file to provision.
+                    None => ctx.write_artifact(
+                        "gobuster-wordlist.txt",
+                        crate::tools::wordlist::RAW.as_bytes(),
+                    )?,
+                };
+                let threads = super::opt_u64(input, "threads", 20).clamp(1, 50);
+                let mut args = vec![
+                    "dir".into(),
+                    "-u".into(),
+                    url,
+                    "-w".into(),
+                    wordlist_path.display().to_string(),
+                    "-q".into(),
+                    "-k".into(), // don't fail on a self-signed/expired cert
+                    "-t".into(),
+                    threads.to_string(),
+                    "--timeout".into(),
+                    "10s".into(),
+                ];
+                if let Some(ext) = super::opt_str_field(input, "extensions") {
+                    if ext.len() > 64 || !ext.chars().all(|c| c.is_ascii_alphanumeric() || c == ',') {
+                        anyhow::bail!("invalid extensions list");
+                    }
+                    args.push("-x".into());
+                    args.push(ext);
+                }
+                Ok(args)
+            }
+            "amass" => {
+                let host = super::str_field(input, "host")?;
+                if host.is_empty()
+                    || host.len() > 253
+                    || !host
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                {
+                    anyhow::bail!("invalid domain for amass");
+                }
+                let timeout_min = super::opt_u64(input, "timeout_minutes", 5).clamp(1, 30);
+                let mut args = vec![
+                    "enum".into(),
+                    "-d".into(),
+                    host,
+                    "-timeout".into(),
+                    timeout_min.to_string(),
+                ];
+                if input.get("brute").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // Active wordlist-based brute forcing on top of active
+                    // resolution: more traffic against the target's and
+                    // resolvers' infrastructure, opt-in beyond the --offensive
+                    // gate this whole tool already sits behind.
+                    args.push("-brute".into());
+                }
+                Ok(args)
+            }
             other => anyhow::bail!("no argument builder for `{other}`"),
         }
     }
@@ -478,6 +601,12 @@ impl HostTool {
             "nuclei" => 600,
             "msfconsole" => 300,
             "john" => 360,
+            "testssl.sh" => 300,
+            "gobuster" => 300,
+            // amass's own -timeout_minutes caps at 30 min (1,800s); this outer
+            // bound leaves a 2-minute buffer for it to flush output and exit
+            // cleanly, the same pattern nikto's -maxtime uses under its adapter.
+            "amass" => 1_920,
             _ => 120,
         })
     }
@@ -603,6 +732,54 @@ impl HostTool {
                     "john: finished, nothing cracked".into()
                 } else {
                     format!("john: {cracked} hash(es) cracked")
+                }
+            }
+            "testssl.sh" => {
+                let vulnerable: Vec<&str> = lines
+                    .iter()
+                    .filter(|l| l.contains("VULNERABLE"))
+                    .copied()
+                    .collect();
+                if vulnerable.is_empty() {
+                    "testssl.sh: no VULNERABLE findings reported".into()
+                } else {
+                    format!(
+                        "testssl.sh: {} VULNERABLE finding(s): {}",
+                        vulnerable.len(),
+                        vulnerable
+                            .iter()
+                            .take(3)
+                            .map(|l| l.trim())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    )
+                }
+            }
+            "gobuster" => {
+                // gobuster prints one `status: NNN` line per discovered path
+                // in `-q` mode: "/admin (Status: 301) [Size: 178]".
+                let found: Vec<&str> = lines
+                    .iter()
+                    .filter(|l| l.to_ascii_lowercase().contains("(status:"))
+                    .copied()
+                    .collect();
+                if found.is_empty() {
+                    "gobuster: no paths found".into()
+                } else {
+                    format!("gobuster: {} path(s) found", found.len())
+                }
+            }
+            "amass" => {
+                // Default (non-JSON) output: one discovered FQDN per line.
+                let names: Vec<&str> = lines
+                    .iter()
+                    .filter(|l| l.contains('.') && !l.trim().is_empty() && !l.starts_with(['[', ' ']))
+                    .copied()
+                    .collect();
+                if names.is_empty() {
+                    "amass: no additional names resolved".into()
+                } else {
+                    format!("amass: {} name(s) resolved", names.len())
                 }
             }
             _ => {
@@ -764,6 +941,9 @@ impl Tool for HostTool {
             "nuclei" => "host_nuclei",
             "msfconsole" => "host_msfconsole",
             "john" => "host_john",
+            "testssl.sh" => "host_testssl",
+            "gobuster" => "host_gobuster",
+            "amass" => "host_amass",
             _ => "host_unknown",
         }
     }
@@ -856,6 +1036,33 @@ impl Tool for HostTool {
                     "rules": {"type": "boolean", "description": "apply word-mangling rules (slower)"}
                 },
                 "required": ["hashes"]
+            }),
+            "testssl.sh" => json!({
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "in-scope host or IP"},
+                    "port": {"type": "integer", "description": "TLS port, default 443"}
+                },
+                "required": ["host"]
+            }),
+            "gobuster" => json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "in-scope http(s) url"},
+                    "wordlist": {"type": "string", "description": "optional wordlist path under the tools dir or data root; defaults to the bundled list"},
+                    "threads": {"type": "integer", "description": "1-50, default 20"},
+                    "extensions": {"type": "string", "description": "comma-separated extensions, e.g. \"php,bak\""}
+                },
+                "required": ["url"]
+            }),
+            "amass" => json!({
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "in-scope domain"},
+                    "timeout_minutes": {"type": "integer", "description": "1-30, default 5"},
+                    "brute": {"type": "boolean", "description": "also active-brute-force subdomains (more traffic)"}
+                },
+                "required": ["host"]
             }),
             _ => json!({"type": "object", "properties": {}}),
         }
@@ -1037,13 +1244,70 @@ mod tests {
 
     #[test]
     fn active_tools_are_gated() {
-        for b in ["sqlmap", "hydra", "nuclei", "msfconsole", "john"] {
+        for b in ["sqlmap", "hydra", "nuclei", "msfconsole", "john", "amass"] {
             assert!(entry(b).offensive, "{b} must require --offensive");
         }
-        for b in ["nmap", "nikto", "tcpdump"] {
+        for b in ["nmap", "nikto", "tcpdump", "testssl.sh", "gobuster"] {
             assert!(!entry(b).offensive, "{b} must stay non-offensive");
         }
         assert_eq!(entry("nuclei").binary, "nuclei");
+    }
+
+    #[test]
+    fn testssl_builds_host_and_port() {
+        let ctx = super::super::test_ctx();
+        let t = HostTool { entry: entry("testssl.sh") };
+        let args = t.build_args(&json!({"host": "example.com"}), &ctx).unwrap();
+        assert!(args.contains(&"--warnings".to_string()));
+        assert!(args.last().unwrap() == "example.com");
+
+        let args = t
+            .build_args(&json!({"host": "example.com", "port": 8443}), &ctx)
+            .unwrap();
+        assert_eq!(args.last().unwrap(), "example.com:8443");
+
+        assert!(t.build_args(&json!({"host": "example.com", "port": 70_000}), &ctx).is_err());
+    }
+
+    #[test]
+    fn gobuster_defaults_to_the_bundled_wordlist_and_validates_the_url() {
+        let ctx = super::super::test_ctx();
+        let g = HostTool { entry: entry("gobuster") };
+        let args = g.build_args(&json!({"url": "https://example.com"}), &ctx).unwrap();
+        assert_eq!(args[0], "dir");
+        assert!(args.contains(&"-w".to_string()));
+        let wl_idx = args.iter().position(|a| a == "-w").unwrap() + 1;
+        assert!(args[wl_idx].ends_with("gobuster-wordlist.txt"), "{:?}", args[wl_idx]);
+        assert!(std::path::Path::new(&args[wl_idx]).exists(), "wordlist must actually be written");
+
+        assert!(g.build_args(&json!({"url": "ftp://example.com"}), &ctx).is_err(), "scheme");
+        assert!(g
+            .build_args(&json!({"url": "https://example.com", "extensions": "php;rm -rf"}), &ctx)
+            .is_err());
+
+        let args = g
+            .build_args(&json!({"url": "https://example.com", "threads": 999}), &ctx)
+            .unwrap();
+        let t_idx = args.iter().position(|a| a == "-t").unwrap() + 1;
+        assert_eq!(args[t_idx], "50", "threads must clamp to the max");
+    }
+
+    #[test]
+    fn amass_validates_domain_and_gates_brute_force_behind_an_explicit_flag() {
+        let ctx = super::super::test_ctx();
+        let a = HostTool { entry: entry("amass") };
+        let args = a.build_args(&json!({"host": "example.com"}), &ctx).unwrap();
+        assert_eq!(args, vec!["enum", "-d", "example.com", "-timeout", "5"]);
+        assert!(!args.contains(&"-brute".to_string()));
+
+        let args = a
+            .build_args(&json!({"host": "example.com", "brute": true, "timeout_minutes": 999}), &ctx)
+            .unwrap();
+        assert!(args.contains(&"-brute".to_string()));
+        let t_idx = args.iter().position(|a| a == "-timeout").unwrap() + 1;
+        assert_eq!(args[t_idx], "30", "timeout_minutes must clamp to the max");
+
+        assert!(a.build_args(&json!({"host": "example.com; rm -rf /"}), &ctx).is_err());
     }
 
     #[test]

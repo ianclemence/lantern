@@ -27,6 +27,11 @@ const PACKAGES: &[(&str, &str)] = &[
     ("hydra", "hydra"),
     ("tcpdump", "tcpdump"),
     ("bwrap", "bubblewrap"),
+    ("gobuster", "gobuster"),
+    // Debian/Ubuntu carry amass in their repos on most releases; where they
+    // don't, the same "missing, no apt-get / no sudo" messages the rest of
+    // this list already prints apply - this never blocks the rest of setup.
+    ("amass", "amass"),
 ];
 
 /// Toolchain needed to build john and to clone the template set.
@@ -37,6 +42,7 @@ const PROVISION_TOOLS: &[&str] = &["git", "gcc", "make", "configure", "sudo", "a
 
 const JOHN_REPO: &str = "https://github.com/openwall/john.git";
 const TEMPLATES_REPO: &str = "https://github.com/projectdiscovery/nuclei-templates.git";
+const TESTSSL_REPO: &str = "https://github.com/drwetter/testssl.sh.git";
 const MSF_KEY_URL: &str = "https://apt.metasploit.com/metasploit-framework.gpg.key";
 const MSF_RING: &str = "/usr/share/keyrings/metasploit-framework.gpg";
 const MSF_SOURCES_PATH: &str = "/etc/apt/sources.list.d/metasploit-framework.sources";
@@ -213,7 +219,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         ));
     }
 
-    // 6. exploit framework ---------------------------------------------------------
+    // 6. testssl.sh ------------------------------------------------------------
+    if resolve(&config, "testssl.sh").is_ok() {
+        ok("testssl.sh");
+    } else if config.offline {
+        skipped("testssl.sh: offline mode, not cloned");
+    } else if resolve(&config, "git").is_err() {
+        warn("git is unavailable - cannot fetch testssl.sh");
+    } else {
+        installing("testssl.sh (shallow clone into the tools dir)");
+        let dest = tools_dir.join("testssl.sh");
+        install_testssl(&mut ctx, &dest).await?;
+        ok("testssl.sh");
+    }
+
+    // 7. exploit framework ---------------------------------------------------------
     if resolve(&config, "msfconsole").is_ok() {
         ok("msfconsole");
     } else if config.offline {
@@ -223,7 +243,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         install_metasploit(&mut ctx, &config, sudo, apt).await?;
     }
 
-    // 7. report --------------------------------------------------------------------
+    // 8. report --------------------------------------------------------------------
     println!("\n  result:");
     let mut missing = Vec::new();
     for bin in &user_allowlist {
@@ -562,6 +582,50 @@ async fn install_nuclei(tools_dir: &Path) -> anyhow::Result<()> {
         dest.display(),
         std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0)
     ));
+    Ok(())
+}
+
+/// testssl.sh ships no compiled binary - it is a bash script invoked
+/// directly (the kernel's shebang handling runs `/bin/bash testssl.sh argv…`
+/// via execve, exactly like `python3 script.py` in `code_run`; there is no
+/// shell string interpolation of operator input anywhere in that path).
+/// Cloning it is the same shape as `clone_templates`.
+async fn install_testssl(ctx: &mut ToolCtx, dest: &Path) -> anyhow::Result<()> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).ok();
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    run_cmd(
+        ctx,
+        "setup",
+        "git",
+        &[
+            "clone".into(),
+            "--depth".into(),
+            "1".into(),
+            TESTSSL_REPO.into(),
+            dest.display().to_string(),
+        ],
+        Duration::from_secs(300),
+        None,
+    )
+    .await?;
+    let script = dest.join("testssl.sh");
+    if !script.is_file() {
+        bail!("testssl.sh clone did not produce {}", script.display());
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    // The restricted PATH looks up the binary by exact name; a symlink
+    // avoids copying the script and keeps a `git pull` on a later setup
+    // effective without re-linking.
+    let link = ctx.config.tools_dir.join("bin/testssl.sh");
+    std::fs::create_dir_all(ctx.config.tools_dir.join("bin")).ok();
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&script, &link)
+        .with_context(|| format!("linking {} -> {}", link.display(), script.display()))?;
     Ok(())
 }
 

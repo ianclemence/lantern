@@ -4,7 +4,9 @@
 
 pub mod dirb;
 pub mod dns;
+pub mod secret_scan;
 pub mod subdomains;
+pub mod waf_fingerprint;
 pub mod ask;
 pub mod code;
 pub mod host;

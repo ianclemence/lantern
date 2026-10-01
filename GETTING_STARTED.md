@@ -123,7 +123,7 @@ lantern doctor
   disk      : 6.55 GB free of 30.79 GB (floor keeps 6.16 GB free)
   generation: deepseek / deepseek-flash @ https://api.deepseek.com [NO KEY - run `lantern setup`]
   embeddings: ollama nomic-embed-text @ http://127.0.0.1:11434 - 768-dim
-  tools     : 12 native, allowlist: nmap sqlmap nikto hydra tcpdump nuclei msfconsole john bwrap
+  tools     : 15 native, allowlist: nmap sqlmap nikto hydra tcpdump nuclei msfconsole john bwrap testssl.sh gobuster amass
   runtime   : concurrency 3 | task timeout 120s | child 512 MB / 60 CPU-s | token budget 6000
   warnings  :
     - no generation key: runs are limited to --dry-run
@@ -281,7 +281,7 @@ The defaults these lines are there to check:
 | knob | default | where the number came from |
 |---|---|---|
 | steps per role | orchestrator 1, planner 1, researcher 6, coder 2, pentester 6, reflector 1 (17 max) | the real read-only run above used 16 of 17 |
-| context budget | 6,000 tokens (compress at 4,500, keep 1,500) | a call starts with 3,034-3,290 tokens before the conversation: 2,770 for the 20 tool schemas sent on every request, 264-520 for the system prompt |
+| context budget | 6,000 tokens (compress at 4,500, keep 1,500) | a call starts at 721-3,193 tokens before the conversation, depending on the role: each role's tool-calling loop only pays for the schemas of the tools in its own focus list (`Registry::defs_for`), not the full registry - `cargo test -p lantern-agent --test measure_prompts -- --nocapture` prints the live per-role numbers |
 | `LANTERN_TASK_TIMEOUT_SECS` | 120 s, for the sandboxed analysis script | longest script actually recorded: 33 ms, zero timeouts - a safety cap, not a target |
 
 The first run with a real key gives you the cost number; the lines above are
