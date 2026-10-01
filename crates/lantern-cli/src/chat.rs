@@ -622,6 +622,7 @@ fn start_flow(
         .offensive(offensive)
         .roles(roles);
     opts.max_steps = ui.session.steps;
+    opts.extra_steps = parsed.step_boosts();
     opts.directive = Some(instruction.to_string());
 
     let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();

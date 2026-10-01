@@ -4,6 +4,7 @@
 
 pub mod dirb;
 pub mod dns;
+pub mod subdomains;
 pub mod ask;
 pub mod code;
 pub mod host;

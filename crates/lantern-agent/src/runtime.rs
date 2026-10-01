@@ -45,6 +45,12 @@ pub struct FlowOptions {
     pub roles: Vec<RoleId>,
     /// Override the per-role step cap (clamped down, never up, per role).
     pub max_steps: Option<usize>,
+    /// Additional steps earned by a role from how much of the operator's own
+    /// instruction (`lantern ask`) pointed at it - see
+    /// `intent::Intent::step_boosts`. Raises a role's budget above its
+    /// static default, unlike `max_steps`, which only ever lowers it; an
+    /// explicit `max_steps` still wins as the hard ceiling over both.
+    pub extra_steps: Vec<(RoleId, usize)>,
     /// Roles may stop and ask the operator a question (`ask_operator`).
     pub interactive: bool,
     /// The operator's own instruction, verbatim (`lantern ask`). Stored with
@@ -71,6 +77,7 @@ impl std::fmt::Debug for FlowOptions {
             .field("offensive", &self.offensive)
             .field("roles", &self.roles)
             .field("max_steps", &self.max_steps)
+            .field("extra_steps", &self.extra_steps)
             .field("interactive", &self.interactive)
             .field(
                 "directive",
@@ -104,6 +111,7 @@ impl FlowOptions {
             offensive: false,
             roles: Vec::new(),
             max_steps: None,
+            extra_steps: Vec::new(),
             interactive: false,
             directive: None,
             progress: None,
@@ -528,9 +536,19 @@ async fn run_role(
     )?;
     agent.db.task_started(task)?;
 
+    let boost = opts
+        .extra_steps
+        .iter()
+        .find(|(r, _)| *r == id)
+        .map(|(_, n)| *n)
+        .unwrap_or(0);
+    let boosted_default = meta.max_steps + boost;
     let max_steps = match opts.max_steps {
-        Some(n) => meta.max_steps.min(n.max(1)),
-        None => meta.max_steps,
+        // An explicit --steps is the operator's own hard ceiling and still
+        // wins over a vocabulary-earned boost, the same way --offensive is
+        // always the final word over what a prompt asks for.
+        Some(n) => boosted_default.min(n.max(1)),
+        None => boosted_default,
     };
     let budget = Duration::from_secs(
         max_steps as u64 * (agent.config.llm.timeout_secs.saturating_add(60)),

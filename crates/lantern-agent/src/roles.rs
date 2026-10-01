@@ -81,6 +81,7 @@ static ROLES: [Role; 6] = [
         mission: "Passive reconnaissance only: what exists, what it runs, what it says.",
         focus: &[
             "dns_lookup",
+            "subdomain_enum",
             "whois",
             "http_probe",
             "tls_inspect",

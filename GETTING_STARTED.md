@@ -185,7 +185,22 @@ stdin. The full text is stored with the flow and each role sees its head, so a
 intent card says what was understood - and the safety rule is that the prompt
 can only restrain `--offensive`, never grant it: ask for exploitation without
 the flag and you get reconnaissance plus the flag named; pass the flag with a
-defensive-only prompt and the prompt wins, loudly in both cases.
+defensive-only prompt and the prompt wins, loudly in both cases. That rule is
+never relaxed, however the instruction is phrased - it is what keeps a run
+from being steered into exploitation by the prompt's own wording, which
+includes wording that arrived inside a page the agent fetched, not only what
+the operator typed.
+
+What the prompt *can* do is shape how the fixed pipeline spends its budget.
+Every role still runs - a prompt never removes one - but a role whose
+territory the instruction repeatedly names earns up to 4 extra tool-calling
+steps over its default (`vocabulary points at ...` / `step budget : ...` in
+the intent card say which ones and why). Mentioning "GraphQL", "IAM role",
+"Kerberoasting", "JWT", "container escape" or similar once is enough to steer
+the pentester role's attention there; naming several such checks across a
+longer framework is what earns the extra steps, capped so repeating a
+keyword cannot buy an unbounded budget. An explicit `--steps` is still the
+hard ceiling over all of it.
 
 `chat` is the same flow behind a conversational screen: the transcript stays
 in the terminal's scrollback while a small viewport shows status, live role

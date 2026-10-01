@@ -97,6 +97,38 @@ pub struct Intent {
     /// Roles the prompt's vocabulary points at. Empty means "default
     /// pipeline" - most short instructions name no role at all.
     pub roles_hint: Vec<RoleId>,
+    /// How many distinct `ROLE_SIGNALS` keywords matched each role in
+    /// `roles_hint`, in the same order. A short instruction names a role
+    /// once or not at all; a long, detailed framework repeats a role's
+    /// vocabulary many times over (several named injection classes, several
+    /// named auth checks, ...). `step_boosts` turns that repetition into an
+    /// actual larger step budget, so a rich prompt gets more room to work
+    /// without the operator having to compute and pass `--steps` by hand.
+    pub role_weight: Vec<(RoleId, usize)>,
+}
+
+/// A role's step budget is never raised by more than this many steps from
+/// vocabulary alone, however much of the prompt points at it - it is a
+/// convenience for a detailed prompt, not a way to buy an unbounded model
+/// budget by repeating keywords. The operator's own `--steps` cap, when
+/// given, still wins over everything computed here (see `resolve_offensive`
+/// for the same "flag is final authority, prompt only narrows or - for cost
+/// convenience only - nudges within a hard ceiling" shape).
+pub const MAX_ROLE_STEP_BOOST: usize = 4;
+
+impl Intent {
+    /// Per-role step increase earned by how much of the prompt's vocabulary
+    /// pointed at that role, each capped at `MAX_ROLE_STEP_BOOST`. One
+    /// keyword match earns no boost (that is just "this role is relevant",
+    /// already captured by `roles_hint`); each additional match earns one
+    /// more step, up to the cap.
+    pub fn step_boosts(&self) -> Vec<(RoleId, usize)> {
+        self.role_weight
+            .iter()
+            .map(|(r, n)| (*r, n.saturating_sub(1).min(MAX_ROLE_STEP_BOOST)))
+            .filter(|(_, boost)| *boost > 0)
+            .collect()
+    }
 }
 
 /// Action verbs and tool names that mean "actively test", not "look and
@@ -124,6 +156,26 @@ const OFFENSIVE_SIGNALS: &[&str] = &[
     "penetration test",
     "pentest",
     "red team",
+    // Directed verbs for techniques a large firm would expect covered.
+    // Topic nouns for the same territory ("kerberoasting" as a coverage
+    // item, say) still only earn a role hint below, the same way "privilege
+    // escalation" already does - only an instruction to *do* it counts here.
+    "kerberoast",
+    "pass-the-hash",
+    "pass the hash",
+    "ntlm relay",
+    "golden ticket",
+    "silver ticket",
+    "dcsync",
+    "lateral movement",
+    "dump credentials",
+    "dump hashes",
+    "bypass mfa",
+    "bypass authentication",
+    "take over the bucket",
+    "assume the role",
+    "pivot into",
+    "escalate to domain admin",
 ];
 
 /// Explicit restraint. Any one of these makes the run reconnaissance-only no
@@ -174,6 +226,48 @@ const ROLE_SIGNALS: &[(&str, RoleId)] = &[
     ("idor", RoleId::Pentester),
     ("broken access", RoleId::Pentester),
     ("privilege esc", RoleId::Pentester),
+    // API security (OWASP API Top 10 vocabulary).
+    ("api security", RoleId::Pentester),
+    ("rest api", RoleId::Pentester),
+    ("graphql", RoleId::Pentester),
+    ("openapi", RoleId::Pentester),
+    ("swagger", RoleId::Pentester),
+    ("jwt", RoleId::Pentester),
+    ("oauth", RoleId::Pentester),
+    ("saml", RoleId::Pentester),
+    ("rate limit", RoleId::Pentester),
+    ("mass assignment", RoleId::Pentester),
+    // Cloud posture.
+    ("s3 bucket", RoleId::Pentester),
+    ("cloud storage", RoleId::Pentester),
+    ("iam policy", RoleId::Pentester),
+    ("iam role", RoleId::Pentester),
+    ("metadata service", RoleId::Pentester),
+    ("instance metadata", RoleId::Pentester),
+    ("misconfigured bucket", RoleId::Pentester),
+    ("cloud misconfiguration", RoleId::Researcher),
+    // Internal/Active Directory - msfconsole already carries real SMB,
+    // Kerberos and LDAP modules; this only improves how reliably the
+    // pentester role gets pointed at them.
+    ("active directory", RoleId::Pentester),
+    ("kerberoast", RoleId::Pentester),
+    ("ntlm", RoleId::Pentester),
+    ("smb relay", RoleId::Pentester),
+    ("domain admin", RoleId::Pentester),
+    ("lateral movement", RoleId::Pentester),
+    ("golden ticket", RoleId::Pentester),
+    // Container / orchestration.
+    ("container escape", RoleId::Pentester),
+    ("kubernetes", RoleId::Pentester),
+    ("k8s", RoleId::Pentester),
+    ("docker socket", RoleId::Pentester),
+    // Certificate-transparency subdomain mapping (subdomain_enum); "subdomain"
+    // and "attack surface" themselves are already covered above.
+    ("certificate transparency", RoleId::Researcher),
+    // Supply chain.
+    ("dependency", RoleId::Coder),
+    ("supply chain", RoleId::Coder),
+    ("sbom", RoleId::Coder),
     ("business logic", RoleId::Coder),
     ("workflow", RoleId::Coder),
     ("transaction", RoleId::Coder),
@@ -259,12 +353,19 @@ pub fn parse_intent(text: &str) -> Intent {
         }
     }
     for (kw, role) in ROLE_SIGNALS {
-        if lower.contains(kw) && !intent.roles_hint.contains(role) {
-            intent.roles_hint.push(*role);
+        if lower.contains(kw) {
+            if !intent.roles_hint.contains(role) {
+                intent.roles_hint.push(*role);
+            }
+            match intent.role_weight.iter_mut().find(|(r, _)| r == role) {
+                Some((_, n)) => *n += 1,
+                None => intent.role_weight.push((*role, 1)),
+            }
         }
     }
     // Pipeline order, so a hint never reorders the cast.
     intent.roles_hint.sort_by_key(|r| *r as usize);
+    intent.role_weight.sort_by_key(|(r, _)| *r as usize);
     intent
 }
 
@@ -400,6 +501,67 @@ mod tests {
     fn framework_vocabulary_maps_to_roles_in_pipeline_order() {
         let i = parse_intent("business logic and workflow integrity, then coverage and severity");
         assert_eq!(i.roles_hint, vec![RoleId::Coder, RoleId::Reflector]);
+    }
+
+    #[test]
+    fn step_boost_scales_with_how_much_of_the_prompt_points_at_a_role() {
+        // One mention of pentester territory: relevant, but not enough
+        // repetition to earn extra budget over the role's own default.
+        let one_hit = parse_intent("Check the login page.");
+        assert!(one_hit.step_boosts().is_empty(), "{:?}", one_hit.step_boosts());
+
+        // A framework that repeatedly names pentester-territory checks earns
+        // a bounded boost instead of making the operator compute --steps.
+        let many_hits = parse_intent(
+            "Cover injection, xss, csrf, ssrf, idor, broken access, session \
+             handling and upload validation in detail.",
+        );
+        let boosts = many_hits.step_boosts();
+        let pentester_boost = boosts
+            .iter()
+            .find(|(r, _)| *r == RoleId::Pentester)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        assert!(pentester_boost > 0, "{boosts:?}");
+        assert!(pentester_boost <= MAX_ROLE_STEP_BOOST, "{boosts:?}");
+    }
+
+    #[test]
+    fn step_boost_is_capped_regardless_of_how_much_vocabulary_repeats() {
+        let kitchen_sink = parse_intent(
+            "injection exploit payload xss csrf ssrf idor bypass authorization \
+             authentication session brute upload traversal broken access \
+             privilege esc api security rest api graphql openapi swagger jwt \
+             oauth saml rate limit mass assignment s3 bucket cloud storage \
+             iam policy iam role metadata service instance metadata \
+             active directory kerberoast ntlm smb relay domain admin \
+             lateral movement golden ticket container escape kubernetes \
+             k8s docker socket login",
+        );
+        let boost = kitchen_sink
+            .step_boosts()
+            .into_iter()
+            .find(|(r, _)| *r == RoleId::Pentester)
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        assert_eq!(boost, MAX_ROLE_STEP_BOOST, "must cap, not scale unbounded");
+    }
+
+    #[test]
+    fn modern_technique_vocabulary_points_at_the_pentester_role() {
+        for text in [
+            "Test the GraphQL API for broken object level authorization",
+            "Check IAM role trust policies and S3 bucket ACLs",
+            "Attempt Kerberoasting against the domain controllers",
+            "Look for container escape paths from the Kubernetes pods",
+            "Audit the JWT validation and OAuth flow",
+        ] {
+            let i = parse_intent(text);
+            assert!(
+                i.roles_hint.contains(&RoleId::Pentester),
+                "expected pentester hint for: {text}"
+            );
+        }
     }
 
     #[test]

@@ -185,7 +185,7 @@ never competes with logs, artifacts and findings for space.
 |---|---|---|
 | orchestrator | turns the objective into a written plan | - |
 | planner | reorders the plan by risk and effort | - |
-| researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, web search | `dns_lookup`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
+| researcher | passive recon: DNS, TLS, HTTP headers, WHOIS, open ports, subdomains, web search | `dns_lookup`, `subdomain_enum`, `tls_inspect`, `http_probe`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
 | coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `code_run` |
 | pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
 | reflector | reviews the evidence quality and confidence of every finding | `memory_search`, `ask_operator`, `plan_patch` |
@@ -198,8 +198,10 @@ gate *before* the tool body runs.
 
 ### Tools
 
-In-process (no child process): `port_scan`, `dns_lookup`, `http_probe`,
-`tls_inspect`, `whois`, `dir_bruteforce` (built-in 2,419-entry wordlist),
+In-process (no child process): `port_scan`, `dns_lookup`, `subdomain_enum`
+(certificate-transparency lookup via crt.sh - passive, touches no target
+infrastructure; candidates are labelled in/out of scope, never auto-added to
+it), `http_probe`, `tls_inspect`, `whois`, `dir_bruteforce` (built-in 2,419-entry wordlist),
 `web_search` (DuckDuckGo HTML by default, a search API if you configure one;
 `mode: vulnerability` puts matching NVD CVEs and their CVSS scores first),
 `memory_search`, `memory_store`, `ask_operator` (only under `--interactive`,

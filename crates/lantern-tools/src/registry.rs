@@ -81,6 +81,7 @@ impl Registry {
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::tools::port_scan::PortScan),
             Arc::new(crate::tools::dns::DnsLookup),
+            Arc::new(crate::tools::subdomains::SubdomainEnum),
             Arc::new(crate::tools::http_probe::HttpProbe),
             Arc::new(crate::tools::tls_inspect::TlsInspect),
             Arc::new(crate::tools::whois::Whois),
@@ -215,6 +216,7 @@ mod tests {
         for name in [
             "port_scan",
             "dns_lookup",
+            "subdomain_enum",
             "http_probe",
             "tls_inspect",
             "whois",
