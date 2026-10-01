@@ -3,6 +3,7 @@
 //! an allowlisted host binary.
 
 pub mod dirb;
+pub mod delegate;
 pub mod dns;
 pub mod secret_scan;
 pub mod subdomains;

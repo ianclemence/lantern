@@ -97,6 +97,17 @@ pub struct ArtifactRow {
     pub compressed: bool,
 }
 
+/// What `Db::delete_flow` actually removed, for the caller to report and to
+/// know which artifact files on disk still need removing (the database has
+/// no idea those files exist - it only knows the paths it told a tool to
+/// use).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteSummary {
+    pub commands: usize,
+    pub events: usize,
+    pub artifacts: Vec<ArtifactRow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryRow {
     pub id: i64,

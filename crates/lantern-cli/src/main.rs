@@ -135,6 +135,14 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Permanently remove a flow: every database row, artifact, working
+    /// directory and report it owns
+    Delete {
+        flow_id: String,
+        /// Required: this is immediate and has no retention window behind it
+        #[arg(long)]
+        yes: bool,
+    },
     /// List every tool this build can use
     Tools,
     /// Enforce retention: compress old artifacts, prune, vacuum
@@ -254,6 +262,7 @@ async fn real_main() -> anyhow::Result<()> {
                 }
                 Cmd::Flows { limit } => misc::flows(&config, limit)?,
                 Cmd::Report { flow_id, out } => misc::report(&config, &flow_id, out)?,
+                Cmd::Delete { flow_id, yes } => println!("{}", misc::delete_flow(&config, &flow_id, yes)?),
                 Cmd::Tools => misc::tools(&config)?,
                 Cmd::Doctor | Cmd::Gc => unreachable!("handled above"),
             }

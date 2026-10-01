@@ -229,7 +229,9 @@ const COMMANDS: &[PaletteCmd] = &[
     PaletteCmd { name: "offensive", desc: "gated tools on|off", needs_args: true },
     PaletteCmd { name: "dry-run", desc: "scripted runs on|off", needs_args: true },
     PaletteCmd { name: "steps", desc: "cap steps per role (/steps 4)", needs_args: true },
+    PaletteCmd { name: "new", desc: "start a fresh session (clears target/scope/roles)", needs_args: false },
     PaletteCmd { name: "flows", desc: "list recorded flows", needs_args: false },
+    PaletteCmd { name: "delete", desc: "permanently remove a flow (/delete flw_... yes)", needs_args: true },
     PaletteCmd { name: "clear", desc: "clear the screen", needs_args: false },
     PaletteCmd { name: "quit", desc: "exit", needs_args: false },
 ];
@@ -669,7 +671,7 @@ fn start_flow(
 }
 
 const HELP_LINES: &[&str] = &[
-    "commands: /target /scope /roles /offensive /dry-run /steps /flows /clear /quit",
+    "commands: /target /scope /roles /offensive /dry-run /steps /new /flows /delete /clear /quit",
     "keys: Enter send · Esc abort/close · Tab complete · ↑↓ history · ^C quit",
     "while a flow runs, a typed line is noted for its later roles; Esc stops it.",
 ];
@@ -764,6 +766,24 @@ fn run_command(
                 }
             }
         }
+        "new" => {
+            // Fresh session: settings reset to blank, nothing destroyed.
+            // Every flow already run stays in the database exactly as it
+            // was - /new starts the next one, it does not undo the last.
+            let was = (ui.session.target.clone(), ui.flows);
+            ui.session = Session::default();
+            ui.trail.clear();
+            say(
+                terminal,
+                &[format!(
+                    "new session - target/scope/roles/offensive/dry-run/steps reset{}",
+                    match was.0 {
+                        Some(t) => format!(" (previous target was {t}; {} flow(s) run so far stay recorded)", was.1),
+                        None => String::new(),
+                    }
+                )],
+            )?;
+        }
         "flows" => {
             let db = Db::open(&config.paths.db())?;
             let flows = db.list_flows(10)?;
@@ -775,6 +795,18 @@ fn run_command(
                     lines.push(format!("{:<26} {:<10} {}", f.id, f.status, f.target));
                 }
                 say(terminal, &lines)?;
+            }
+        }
+        "delete" => {
+            let flow_id = args.first().copied().unwrap_or("");
+            if flow_id.is_empty() {
+                say(terminal, &["usage: /delete flw_abc123 yes".into()])?;
+            } else {
+                let yes = args.get(1).map(|a| a.eq_ignore_ascii_case("yes")).unwrap_or(false);
+                match crate::misc::delete_flow(config, flow_id, yes) {
+                    Ok(msg) => say(terminal, &[msg])?,
+                    Err(e) => say(terminal, &[format!("{e:#}")])?,
+                }
             }
         }
         "clear" => {

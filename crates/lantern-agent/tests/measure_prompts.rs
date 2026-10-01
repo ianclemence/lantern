@@ -12,6 +12,15 @@
 //! means the fixed overhead grows every time *any* tool is added, even one
 //! only the pentester role ever sees, and this test would eventually fail
 //! for a researcher-only addition that costs the researcher role nothing.
+//!
+//! Orchestrator and planner are measured separately, not folded into
+//! `worst`: they have an empty `focus` and never call `with_tools` at all
+//! (`plan_phase`/`planner_phase` use a plain `agent.complete()`, not
+//! `role_loop`) - `defs_for(&[])`'s "empty focus falls back to everything"
+//! rule exists for a future caller with no declared focus, not for these
+//! two, whose real tool-schema cost on every request is zero. Measuring
+//! them against the full registry would make this test fail every time any
+//! tool is added anywhere, for a cost neither role ever actually pays.
 
 use lantern_agent::prompts;
 use lantern_agent::roles::roles;
@@ -31,8 +40,6 @@ fn the_fixed_overhead_of_a_call_stays_small() {
     let scope = "example.com, 104.20.23.154/32, 172.66.147.243/32";
     let mut worst = 0usize;
     for r in roles() {
-        let defs = reg.defs_for(r.focus);
-        let schema: usize = defs.iter().map(|d| (d.wire().to_string().len() + 3) / 4).sum();
         let system = prompts::system(
             r,
             "example.com",
@@ -41,6 +48,22 @@ fn the_fixed_overhead_of_a_call_stays_small() {
             lantern_agent::intent::EngagementProfile::General,
         );
         let sys_tokens = (system.len() + 3) / 4;
+
+        if r.focus.is_empty() {
+            // orchestrator/planner: no tool-calling loop, no schema cost -
+            // see the module doc comment for why this isn't folded into `worst`.
+            println!(
+                "role {:11}: no tool-calling loop (plain completion) + {:>4} tokens system \
+                 = {:>4} tokens before the first word",
+                r.id.as_str(),
+                sys_tokens,
+                sys_tokens
+            );
+            continue;
+        }
+
+        let defs = reg.defs_for(r.focus);
+        let schema: usize = defs.iter().map(|d| (d.wire().to_string().len() + 3) / 4).sum();
         let overhead = schema + sys_tokens;
         worst = worst.max(overhead);
         println!(

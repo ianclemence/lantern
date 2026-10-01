@@ -31,6 +31,68 @@ pub fn flows(config: &Config, limit: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Remove a flow and everything it owns: every database row across every
+/// table (`Db::delete_flow`, one transaction), the flow's own artifact
+/// files, its per-flow working directory, and its rendered report. Asks for
+/// `yes` to actually happen unless the caller already confirmed - this is
+/// the one command in this CLI that destroys data with no retention window
+/// behind it (`gc` ages things out on a schedule the operator already set;
+/// this is immediate, and the point of giving it a name of its own, `rm`
+/// aside, is that it should never be the thing a tab-completion accident
+/// runs).
+///
+/// Returns the result message rather than printing it: `chat` is a managed
+/// inline-viewport TUI, and a raw `println!` from here mid-session would
+/// land outside that viewport's own redraw and corrupt the display until
+/// the next full redraw happened to paper over it. The CLI entry point
+/// prints the string itself; `chat` hands it to `say()`.
+pub fn delete_flow(config: &Config, flow_id: &str, yes: bool) -> anyhow::Result<String> {
+    let db = Db::open(&config.paths.db())?;
+    let Some(flow) = db.get_flow(flow_id)? else {
+        anyhow::bail!("no such flow: {flow_id}");
+    };
+    if !yes {
+        anyhow::bail!(
+            "this permanently deletes flow {flow_id} ({}, {} finding(s) if any) and every \
+             command, event, artifact and report it owns - confirm with `yes` to proceed",
+            clip(&flow.target, 60),
+            db.findings_for_flow(flow_id).map(|f| f.len()).unwrap_or(0)
+        );
+    }
+
+    let summary = db
+        .delete_flow(flow_id)?
+        .ok_or_else(|| anyhow::anyhow!("flow {flow_id} vanished mid-delete"))?;
+
+    let mut files_removed = 0usize;
+    for a in &summary.artifacts {
+        if std::fs::remove_file(&a.path).is_ok() {
+            files_removed += 1;
+        }
+    }
+    let artifact_dir = config.paths.artifacts().join(flow_id);
+    if artifact_dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&artifact_dir);
+    }
+    let workdir = config.paths.flows().join(flow_id);
+    if workdir.is_dir() {
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+    let report = config.paths.reports().join(format!("{flow_id}.md"));
+    let report_removed = report.is_file() && std::fs::remove_file(&report).is_ok();
+
+    Ok(format!(
+        "deleted {flow_id}: {} command(s), {} event(s), {} artifact row(s) ({} file(s) \
+         removed), working directory {}, report {}",
+        summary.commands,
+        summary.events,
+        summary.artifacts.len(),
+        files_removed,
+        if workdir.exists() { "left (in use?)" } else { "removed" },
+        if report_removed { "removed" } else { "none" },
+    ))
+}
+
 pub fn report(config: &Config, flow_id: &str, out: Option<PathBuf>) -> anyhow::Result<()> {
     let db = Db::open(&config.paths.db())?;
     let text = lantern_agent::report::build(&db, flow_id)?;

@@ -91,6 +91,7 @@ lantern ask --target T --scope S --file framework.md --dry-run  # a whole framew
 lantern chat                                     # the same flow, conversational: / commands, Esc aborts
 lantern flows                                    # id, status, target, created, scope
 lantern report <flow-id> [--out report.md]        # markdown, from the database, no model call
+lantern delete <flow-id> --yes                     # permanently remove one flow, every row and file
 lantern tools                                     # every tool and its gate
 lantern gc                                        # retention: compress, prune, vacuum
 ```
@@ -110,28 +111,52 @@ validated rather than trusted verbatim, reports render straight from SQLite
 with no model call, and `--dry-run` runs the whole pipeline against a
 scripted provider so the loop is testable without spending anything.
 
-## Roles: a fixed pipeline, not dynamic subagents
+## Roles and delegation: a fixed pipeline with one bounded escape hatch
 
 Six roles run in a set order on every flow - `orchestrator → planner →
 researcher → coder → pentester → reflector` - each a bounded tool-calling
-loop against the configured model. This is deliberately **not** an
-open-ended agent that spawns its own subagents (the way Claude Code's `Task`
-tool or opencode's agent types do): there is no tool a role can call to
-create another model-calling loop, no recursive delegation, and no dynamic
-task decomposition. Every role, every step, every tool call was already
-decided by this fixed structure before the flow started - which is what
-makes a run's cost and shape predictable before you start it (`--dry-run`
-prints the exact token/tool-call estimate), and what makes
-`Registry::defs_for` able to scope each role to a fixed, auditable tool list
-(below) rather than "whatever the model decides to reach for."
+loop against the configured model. The pipeline itself is fixed: no role
+adds, removes, or reorders another role, and that is what makes a run's
+cost and shape predictable before you start it (`--dry-run` prints the
+exact token/tool-call estimate).
+
+Within that fixed pipeline, researcher/coder/pentester can call
+`delegate_task` to spin off one bounded sub-investigation and get back a
+condensed answer - Lantern's answer to Claude Code's `Task` tool or
+opencode's agent types, deliberately narrower than either:
+
+- A delegated sub-task's tools can only be a subset of the **calling role's
+  own** tool list - it can never reach a tool the parent didn't already have,
+  so delegation cannot be used to smuggle in capability.
+- It shares the parent's scope and `--offensive` grant exactly; it cannot
+  exceed either (it is still just a role, running through the same
+  `Registry::execute` choke point as every other tool call).
+- **It cannot delegate again.** `delegate_task` is never in a delegated
+  sub-task's own tool list - not a depth counter that could have an off-by-
+  one, an absent capability - enforced twice over: the sub-task's model
+  literally has no schema for the tool, and the one place a tool call named
+  `delegate_task` could still be handled refuses it by name instead.
+- Capped at 5 steps per call, 10 total across every `delegate_task` call one
+  role makes in its own turn - a role cannot multiply its own step budget
+  unboundedly by calling it repeatedly.
+- Fully audited the same way everything else is: its own task row, its own
+  tool-call events, token/cost counters that already aggregate correctly
+  since a delegated call is still just a call to `agent.chat()`.
+
+What this is not: open-ended, recursive, or dynamic task decomposition. A
+role decides to delegate one sub-question; it does not restructure the
+pipeline, spawn an unbounded tree of agents, or hand a sub-task anything
+it couldn't already reach itself. `Registry::defs_for` still scopes every
+role (and every delegated sub-task) to a fixed, auditable tool list (below)
+rather than "whatever the model decides to reach for."
 
 | Role | Does | Tools |
 |---|---|---|
 | orchestrator | turns the objective into a short written plan | - |
 | planner | reorders the plan by risk and effort | - |
-| researcher | passive recon: DNS, TLS, headers, WHOIS, ports, subdomains, WAF/CDN, leaked secrets, web search | `dns_lookup`, `subdomain_enum`, `tls_inspect`, `http_probe`, `waf_fingerprint`, `secret_scan`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
-| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `code_run`, `secret_scan` |
-| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_testssl`, `host_gobuster`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `host_amass`\*, `waf_fingerprint`, `secret_scan`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch` |
+| researcher | passive recon: DNS, TLS, headers, WHOIS, ports, subdomains, WAF/CDN, leaked secrets, web search | `dns_lookup`, `subdomain_enum`, `tls_inspect`, `http_probe`, `waf_fingerprint`, `secret_scan`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `delegate_task` |
+| coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `code_run`, `secret_scan`, `delegate_task` |
+| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_testssl`, `host_gobuster`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `host_amass`\*, `waf_fingerprint`, `secret_scan`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `delegate_task` |
 | reflector | judges evidence quality and confidence of every finding | `memory_search`, `ask_operator`, `plan_patch` |
 
 \* requires `--offensive`.
@@ -165,7 +190,9 @@ access of its own, every match reported masked), `whois`, `dir_bruteforce`
 (built-in 2,419-entry wordlist), `web_search` (DuckDuckGo by default, a
 search API if configured; `mode: vulnerability` surfaces matching NVD CVEs
 first), `memory_search`, `memory_store`, `ask_operator` (`--interactive`
-only), `plan_patch`.
+only), `plan_patch`, `delegate_task` (one bounded sub-investigation for
+researcher/coder/pentester - see
+[Roles and delegation](#roles-and-delegation-a-fixed-pipeline-with-one-bounded-escape-hatch)).
 
 **One sandboxed child, not a host binary**: `code_run` - a single Python
 script (standard library only) behind `bwrap`, empty network namespace,
@@ -250,6 +277,28 @@ A few things worth knowing about what that does and doesn't guarantee:
 - **No single-instance lock exists or is needed.** There is nothing to
   coordinate: each flow is independent, scope-checked and budgeted on its
   own, and the database is the only shared state.
+
+### Session lifecycle: create, read, update, delete
+
+A "session" in `lantern chat` is its live settings (`target`, `scope`,
+`roles`, `offensive`, `dry-run`, `steps`) plus whatever flows you run under
+them; each flow it starts is its own row in the database, independent of
+the session that created it. Full lifecycle control, all from inside the
+TUI - no need to quit and relaunch to start over, and no file-system
+spelunking to clean up after yourself:
+
+| | command | does |
+|---|---|---|
+| **Create** | `/new` | resets the session's settings to blank - a fresh target, scope, roles, offensive grant and step cap, ready for the next engagement. Nothing is deleted: every flow already run stays exactly as it was. |
+| **Read** | `/flows` | lists recorded flows (id, status, target) - the same data `lantern flows` shows outside chat. |
+| **Update** | `/target`, `/scope`, `/roles`, `/offensive`, `/dry-run`, `/steps` | change one setting of the live session; each takes effect on the next instruction. |
+| **Delete** | `/delete <flow-id> yes` | **permanently** removes one flow: every database row across every table in one transaction (`Db::delete_flow`), its artifact files, its working directory, its rendered report. Typing just `/delete <flow-id>` shows what would be destroyed and refuses - the `yes` has to be deliberate, there is no retention window behind this the way there is behind `lantern gc`'s scheduled pruning. |
+
+The same delete is available outside chat as `lantern delete <flow-id>
+--yes` (same confirmation requirement, same transaction). Deleting one flow
+never touches another - verified directly, not just assumed, in both the
+database layer (`delete_flow`'s own tests) and live, under a real terminal,
+with two flows from two separate `/new` sessions and only one deleted.
 
 What Lantern does **not** currently do: run as a long-lived daemon or
 systemd service, or expose a queue/scheduler of its own. It is a CLI
@@ -453,11 +502,6 @@ honestly, in the order I'd build it:
 - **A real daemon mode**, if scheduled/continuous assessment matters more
   than a systemd timer wrapping the CLI (see
   [Concurrency and multiple sessions](#concurrency-and-multiple-sessions)).
-- **Bounded, single-level subagent delegation**, if the fixed six-role
-  pipeline (see [Roles](#roles-a-fixed-pipeline-not-dynamic-subagents)) ever
-  needs to flex per engagement rather than stay static - a `delegate` tool a
-  role could call for one scoped, budgeted sub-task, reusing the same
-  registry/scope/offensive checks rather than a new trust boundary.
 
 None of these are silently missing: `prompts::engagement_addendum` tells the
 model what it cannot check for a detected profile, specifically so it says

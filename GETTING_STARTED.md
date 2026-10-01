@@ -291,7 +291,16 @@ how the next change gets made from evidence rather than from a guess.
 
 ```sh
 lantern gc      # compress artifacts, prune traces and logs, vacuum when low on space
+lantern delete flw_abc123 --yes   # permanently remove one flow now, rather than wait for retention
 ```
+
+`/new` in `lantern chat` does the same "start over" without leaving the
+session: it resets target/scope/roles/offensive/dry-run/steps to blank for
+the next engagement, without touching any flow already recorded. `/delete
+<flow-id> yes` removes one from inside chat the same way the CLI command
+does - see the README's [Session
+lifecycle](README.md#session-lifecycle-create-read-update-delete) section
+for the full picture.
 
 **Precedence: environment > `~/.config/lantern` files > preset defaults.**
 

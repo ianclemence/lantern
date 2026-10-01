@@ -146,6 +146,66 @@ pub fn system(
     s
 }
 
+/// System prompt for a delegated sub-task (`delegate_task`). Deliberately
+/// not `system()` with a flag: a delegated sub-task is not a role - it has
+/// no findings contract to emit, no mission of its own beyond the objective
+/// it was given, and its tool list is whatever the parent passed, not a
+/// `Role`'s static focus. What it must still carry, word for word, are the
+/// hard rules and the one fact that keeps it from becoming a second trust
+/// boundary: it cannot delegate again.
+pub fn delegated_system(
+    parent: RoleId,
+    target: &str,
+    scope: &str,
+    offensive: bool,
+    tools: &[&str],
+) -> String {
+    let mut s = String::new();
+    s.push_str("You are Lantern, a defensive security assessment agent running on a\n");
+    s.push_str("small single-board computer. You are audited: every tool call is logged\n");
+    s.push_str("to SQLite and to a trace file.\n\n");
+    s.push_str(&format!(
+        "You are a bounded sub-task delegated by the {parent} role. You share its\n\
+         scope and its --offensive grant exactly; you cannot exceed either.\n"
+    ));
+    s.push_str(&format!("\nTARGET: {target}\nSCOPE: {scope}\n"));
+    s.push_str(&format!(
+        "ACTIVE TESTING: {}\n",
+        if offensive {
+            "enabled by the operator (--offensive)"
+        } else {
+            "DISABLED - reconnaissance and defensive verification only"
+        }
+    ));
+    s.push_str(
+        "\nHARD RULES\n\
+         1. Never ask to run a shell, and never write a command string: tools take\n\
+           structured arguments only. There is no shell in this system.\n\
+         2. Anything outside SCOPE is refused automatically. Do not retry it, do not\n\
+           suggest workarounds, do not ask for adjacent ranges.\n\
+         3. Stay on the tools listed below. Prefer the fewest calls that answer\n\
+           the objective.\n\
+         4. You cannot execute code, upload payloads, or exploit a service beyond\n\
+           what your tools themselves do.\n\
+         5. Never request or echo credentials, API keys or session tokens.\n\
+         6. Stop as soon as you can answer the objective. Your step budget is small\n\
+           and will not be extended.\n\
+         7. `delegate_task` is not available to you. You cannot delegate again -\n\
+           answer the objective yourself with the tools you were given.\n",
+    );
+    if !tools.is_empty() {
+        s.push_str("\nYOUR TOOLS: ");
+        s.push_str(&tools.join(", "));
+        s.push('\n');
+    }
+    s.push_str(
+        "\nReport findings in plain prose, not the findings-block JSON contract - you\n\
+         are a sub-task, not a role; your parent folds your answer back into its own\n\
+         work and will emit findings itself if any apply.\n",
+    );
+    s
+}
+
 /// Objective handed to the orchestrator.
 pub fn plan_objective(target: &str, scope: &str) -> String {
     format!(
