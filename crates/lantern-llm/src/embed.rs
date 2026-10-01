@@ -111,7 +111,7 @@ impl OllamaEmbedder {
             .context("POST ollama /api/embeddings")?;
 
         let status = resp.status();
-        let payload = resp.text().await.unwrap_or_default();
+        let payload = crate::fetch::read_capped_text(resp, 16 * 1024 * 1024).await;
         if !status.is_success() {
             let snippet: String = payload.chars().take(200).collect();
             anyhow::bail!("ollama http {status}: {snippet}");

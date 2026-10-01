@@ -289,7 +289,11 @@ already buffered - none of that code runs under the `RLIMIT_AS` that
 protects a sandboxed host-tool child, so a target serving a multi-gigabyte
 or endlessly chunked response cannot force unbounded memory growth in the
 process itself. Verified against a real oversized response from a local TCP
-listener in `fetch.rs`'s tests, not just reasoned about.
+listener in `fetch.rs`'s tests, not just reasoned about. The same bound
+applies, at a more generous cap, to the model-provider responses
+(`lantern_llm::fetch`) and the setup wizard's model-list fetch - a lower-risk
+tier (operator-configured, not the target), bounded anyway rather than left
+as the one unbounded read in the codebase.
 
 ## Setup
 

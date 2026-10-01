@@ -239,7 +239,9 @@ impl Anthropic {
                 .with_context(|| format!("POST {url}"))?;
 
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // Operator-configured and generally trusted, but still bounded:
+            // see fetch.rs for why this is not reused from lantern-tools.
+            let text = crate::fetch::read_capped_text(resp, 16 * 1024 * 1024).await;
 
             if status.is_success() {
                 return serde_json::from_str(&text)

@@ -512,9 +512,7 @@ async fn live_models(p: &Provider, base_url: &str, key: &str) -> Vec<String> {
     let Ok(resp) = req.send().await else {
         return Vec::new();
     };
-    let Ok(text) = resp.text().await else {
-        return Vec::new();
-    };
+    let text = lantern_llm::fetch::read_capped_text(resp, 2 * 1024 * 1024).await;
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
