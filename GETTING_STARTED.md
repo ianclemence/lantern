@@ -31,7 +31,7 @@ sudo apt install build-essential libssl-dev pkg-config
 git clone https://github.com/ianclemence/lantern.git
 cd lantern
 make          # release build, then on-disk and runtime footprint
-make test     # 234 tests, no API spend (scripted provider)
+make test     # 275+ tests, no API spend (scripted provider)
 ```
 
 If `cargo` is not on `PATH` yet, prefix with `export PATH="$HOME/.cargo/bin:$PATH"`
