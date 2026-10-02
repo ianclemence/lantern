@@ -73,21 +73,48 @@ impl Scope {
         self.entries.is_empty()
     }
 
-    /// Is `target` (an IP literal or host name) inside this scope?
+    /// Is `target` (an IP literal, a CIDR range, or a host name) inside this
+    /// scope?
+    ///
+    /// A bare `ip/prefix` target — the shape a tool like `msfconsole` takes
+    /// for `RHOSTS` — is checked as a *network subset*, not as a single
+    /// address: the whole range it names must fall inside one declared scope
+    /// entry (`target_prefix >= entry_prefix`, same network). Naively
+    /// stripping the `/prefix` as if it were a URL path (as this function
+    /// used to) would validate only the network's base address, so a scope of
+    /// `10.0.0.0/24` would wrongly wave through a target of `10.0.0.0/8` —
+    /// a scope bypass that scans far more than was declared. See
+    /// `widening_cidr_is_rejected_even_when_base_address_matches` below.
     pub fn allows(&self, target: &str) -> bool {
         let t = target.trim();
         if t.is_empty() {
             return false;
         }
         let lower = t.to_ascii_lowercase();
+        let after_scheme = lower.split("://").nth(1).unwrap_or(&lower);
+
+        // Bare CIDR shape: no scheme beyond an optional `proto://`, and
+        // exactly one `/` separating an address from an all-digit prefix (so
+        // `example.com/path` and `10.0.0.1/24/x` both fall through to the
+        // ordinary host/IP handling below instead).
+        if let Some((addr, prefix)) = after_scheme.split_once('/') {
+            if !prefix.is_empty() && !prefix.contains('/') && prefix.chars().all(|c| c.is_ascii_digit()) {
+                if let (Ok(ip), Ok(prefix)) = (addr.parse::<IpAddr>(), prefix.parse::<u8>()) {
+                    let max = if ip.is_ipv4() { 32 } else { 128 };
+                    if prefix <= max {
+                        return self.entries.iter().any(|e| match e {
+                            ScopeEntry::Net { ip: net, prefix: net_prefix } => {
+                                prefix >= *net_prefix && in_net(ip, *net, *net_prefix)
+                            }
+                            ScopeEntry::Host(_) => false,
+                        });
+                    }
+                }
+            }
+        }
+
         // Strip a URL-ish prefix so `https://host/path` still matches `host`.
-        let bare = lower
-            .split("://")
-            .nth(1)
-            .unwrap_or(&lower)
-            .split('/')
-            .next()
-            .unwrap_or(&lower);
+        let bare = after_scheme.split('/').next().unwrap_or(after_scheme);
         let bare = bare.split('@').next_back().unwrap_or(bare);
         let bare = strip_port(bare);
 
@@ -219,5 +246,39 @@ mod tests {
         let s = Scope::parse("10.0.0.0/8").unwrap();
         assert!(s.require("8.8.8.8").is_err());
         assert!(s.require("10.1.2.3").is_ok());
+    }
+
+    #[test]
+    fn cidr_target_must_be_a_subset_of_a_scope_entry() {
+        let s = Scope::parse("10.0.0.0/24").unwrap();
+        // Equal range and a narrower range both fall entirely inside /24.
+        assert!(s.allows("10.0.0.0/24"));
+        assert!(s.allows("10.0.0.0/25"));
+        assert!(s.allows("10.0.0.128/25"));
+        // A disjoint /24 next door is still out.
+        assert!(!s.allows("10.0.1.0/24"));
+    }
+
+    #[test]
+    fn widening_cidr_is_rejected_even_when_base_address_matches() {
+        // Regression: the old implementation stripped `/prefix` the same way
+        // it stripped a URL path, then checked only the bare base address
+        // ("10.0.0.0") against scope entries. That base address legitimately
+        // sits inside 10.0.0.0/24, so a target of 10.0.0.0/8 — a request to
+        // touch roughly sixteen million addresses on a scope that authorised
+        // 256 — was incorrectly accepted. It must now be rejected: the
+        // target's own prefix has to be at least as narrow as the entry's.
+        let s = Scope::parse("10.0.0.0/24").unwrap();
+        assert!(!s.allows("10.0.0.0/8"), "a supernet must never pass a narrower scope");
+        assert!(!s.allows("10.0.0.0/0"));
+        assert!(!s.allows("0.0.0.0/0"));
+    }
+
+    #[test]
+    fn cidr_target_outside_any_entry_is_rejected() {
+        let s = Scope::parse("example.com, 192.168.1.5/32").unwrap();
+        assert!(!s.allows("10.0.0.0/24"));
+        // A single host entry (a /32) does not widen to cover a /24 either.
+        assert!(!s.allows("192.168.1.0/24"));
     }
 }

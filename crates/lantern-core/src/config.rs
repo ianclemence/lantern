@@ -5,6 +5,7 @@
 //! writes to disk. Every value falls back to a device-appropriate default, so a
 //! fresh clone boots with no setup at all.
 
+use crate::device::DeviceProfile;
 use crate::error::{CoreError, Result};
 use crate::providers;
 use std::path::{Path, PathBuf};
@@ -134,6 +135,20 @@ pub struct Config {
     pub keep_recent_tokens: usize,
     /// RAM allowance per concurrent task.
     pub ram_per_task_bytes: u64,
+    /// `User-Agent` every in-process HTTP fetch sends to a target
+    /// (`http_probe`, `waf_fingerprint`, `dir_bruteforce`, `web_search`).
+    /// Self-identifying by default - this is a deliberate reading of the
+    /// same audit-first stance as everything else here (every command is
+    /// logged argv-for-argv; a target's own logs seeing honest traffic is
+    /// the same idea, not an oversight), and it lets a defender's SOC
+    /// attribute the traffic in a detection-engineering engagement. Override
+    /// it for an engagement where blending into ordinary browser traffic is
+    /// itself part of what is being tested - but note what overriding this
+    /// does and does not buy: host-tool adapters like `nmap`/`nikto` are not
+    /// behaviourally stealthy regardless of any header (nikto in particular
+    /// is a loud, signature-heavy scanner by design; `sqlmap`'s own
+    /// `--random-agent` is a separate, already-enabled setting).
+    pub user_agent: String,
     pub llm: LlmConfig,
     pub embed: EmbedConfig,
 }
@@ -183,6 +198,14 @@ fn default_tools_dir() -> PathBuf {
     PathBuf::from(home).join(".local/share/lantern-tools")
 }
 
+/// Device-sized default for a child process's `RLIMIT_AS`: a sixteenth of
+/// total RAM, clamped to a sane range. An 8 GiB host lands on the 512 MB this
+/// value used to be hardcoded to; a 16 GiB host gets 1 GiB; a 2 GiB host is
+/// floored at 256 MB rather than being handed an eighth of its entire memory.
+fn default_child_mem_bytes(profile: &DeviceProfile) -> u64 {
+    (profile.mem.total_bytes / 16).clamp(256 * 1024 * 1024, 2048 * 1024 * 1024)
+}
+
 fn default_allowlist() -> Vec<String> {
     [
         "nmap",
@@ -194,6 +217,9 @@ fn default_allowlist() -> Vec<String> {
         "msfconsole",
         "john",
         "bwrap",
+        "testssl.sh",
+        "gobuster",
+        "amass",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -217,7 +243,22 @@ impl Config {
             tools_dir.join("bin").display()
         );
 
-        let concurrency = env_usize("LANTERN_CONCURRENCY", 3).clamp(1, 8);
+        // Device-sized defaults: `lantern doctor` used to compute these and
+        // then throw the numbers away, leaving every box - a 4-core/8 GiB
+        // target and a 64-core/256 GiB build server alike - on the same fixed
+        // `concurrency=3`/`child=512 MB` regardless of what was actually
+        // available. An explicit env var still wins; absent one, the profile
+        // this host actually has now drives the default.
+        let ram_per_task_bytes = env_u64("LANTERN_TASK_RAM_MB", 192) * 1024 * 1024;
+        let profile = DeviceProfile::detect(&paths.root);
+        let concurrency = match env_str("LANTERN_CONCURRENCY") {
+            Some(v) => v.parse::<usize>().unwrap_or(3).clamp(1, 8),
+            None => profile.recommended_concurrency(ram_per_task_bytes).clamp(1, 8),
+        };
+        let child_as_bytes = match env_str("LANTERN_CHILD_MEM_MB") {
+            Some(v) => v.parse::<u64>().unwrap_or(512) * 1024 * 1024,
+            None => default_child_mem_bytes(&profile),
+        };
         // Provider first: it decides the endpoint default and which key
         // variable counts. An unknown id means the operator named something
         // this build has no table for, so every default stays empty and the
@@ -262,7 +303,7 @@ impl Config {
             concurrency,
             task_timeout_secs: env_u64("LANTERN_TASK_TIMEOUT_SECS", 120),
             max_output_bytes: env_u64("LANTERN_MAX_OUTPUT_BYTES", 2 * 1024 * 1024),
-            child_as_bytes: env_u64("LANTERN_CHILD_MEM_MB", 512) * 1024 * 1024,
+            child_as_bytes,
             child_cpu_secs: env_u64("LANTERN_CHILD_CPU_SECS", 60),
             restricted_path: env_str("LANTERN_PATH").unwrap_or(default_restricted_path),
             allowlist: env_str("LANTERN_ALLOWLIST")
@@ -282,7 +323,9 @@ impl Config {
             token_budget,
             summarize_at: env_usize("LANTERN_SUMMARIZE_AT", token_budget.saturating_sub(1_500)),
             keep_recent_tokens: env_usize("LANTERN_KEEP_RECENT_TOKENS", 1_500),
-            ram_per_task_bytes: env_u64("LANTERN_TASK_RAM_MB", 192) * 1024 * 1024,
+            ram_per_task_bytes,
+            user_agent: env_str("LANTERN_USER_AGENT")
+                .unwrap_or_else(|| format!("lantern/{}", env!("CARGO_PKG_VERSION"))),
             llm: LlmConfig {
                 provider: llm_provider,
                 base_url: llm_base.trim_end_matches('/').to_string(),
@@ -340,6 +383,18 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_is_self_identifying_by_default_and_overridable() {
+        std::env::remove_var("LANTERN_USER_AGENT");
+        let c = Config::load().unwrap();
+        assert!(c.user_agent.starts_with("lantern/"), "{}", c.user_agent);
+
+        std::env::set_var("LANTERN_USER_AGENT", "Mozilla/5.0 (compatible; engagement-123)");
+        let c = Config::load().unwrap();
+        std::env::remove_var("LANTERN_USER_AGENT");
+        assert_eq!(c.user_agent, "Mozilla/5.0 (compatible; engagement-123)");
+    }
+
+    #[test]
     fn allowlist_parsing() {
         // `default_allowlist` order is stable and shell-free.
         let a = default_allowlist();
@@ -347,7 +402,7 @@ mod tests {
             a,
             vec![
                 "nmap", "sqlmap", "nikto", "hydra", "tcpdump", "nuclei", "msfconsole", "john",
-                "bwrap"
+                "bwrap", "testssl.sh", "gobuster", "amass"
             ]
         );
         assert!(a.iter().all(|b| !b.contains('/') && !b.contains(' ')));
@@ -361,6 +416,65 @@ mod tests {
         assert!(c.nuclei_templates.ends_with("nuclei-templates"));
         // The restricted PATH must reach both provisioning locations.
         assert!(c.restricted_path.contains(&c.tools_dir.display().to_string()));
+    }
+
+    #[test]
+    fn child_mem_default_scales_with_ram_and_is_bounded() {
+        let small = DeviceProfile {
+            mem: crate::device::MemInfo { total_bytes: 1 * 1024 * 1024 * 1024, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(default_child_mem_bytes(&small), 256 * 1024 * 1024, "floored, not an eighth of 1 GiB");
+
+        let eight_gib = DeviceProfile {
+            mem: crate::device::MemInfo { total_bytes: 8 * 1024 * 1024 * 1024, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(
+            default_child_mem_bytes(&eight_gib),
+            512 * 1024 * 1024,
+            "matches the value this used to be hardcoded to on the reference 8 GiB device"
+        );
+
+        let huge = DeviceProfile {
+            mem: crate::device::MemInfo { total_bytes: 256 * 1024 * 1024 * 1024, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(default_child_mem_bytes(&huge), 2048 * 1024 * 1024, "capped, not a 16 GiB child limit");
+    }
+
+    // `LANTERN_CONCURRENCY`/`LANTERN_CHILD_MEM_MB` are now read conditionally
+    // (device-derived default only when the var is absent), where every
+    // earlier env-backed setting here was an unconditional `env_u64`/`_usize`
+    // with a fixed fallback. That makes these two tests order-sensitive
+    // against each other under the default parallel test runner, since both
+    // mutate the same process-global env vars; one lock serializes them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_vars_still_override_device_derived_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LANTERN_CONCURRENCY", "7");
+        std::env::set_var("LANTERN_CHILD_MEM_MB", "321");
+        let c = Config::load().unwrap();
+        std::env::remove_var("LANTERN_CONCURRENCY");
+        std::env::remove_var("LANTERN_CHILD_MEM_MB");
+        assert_eq!(c.concurrency, 7);
+        assert_eq!(c.child_as_bytes, 321 * 1024 * 1024);
+    }
+
+    #[test]
+    fn concurrency_and_child_mem_are_sane_without_any_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LANTERN_CONCURRENCY");
+        std::env::remove_var("LANTERN_CHILD_MEM_MB");
+        let c = Config::load().unwrap();
+        assert!((1..=8).contains(&c.concurrency), "got {}", c.concurrency);
+        assert!(
+            (256 * 1024 * 1024..=2048 * 1024 * 1024).contains(&c.child_as_bytes),
+            "got {}",
+            c.child_as_bytes
+        );
     }
 
     #[test]

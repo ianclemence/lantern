@@ -30,6 +30,18 @@ pub enum ProgressEvent {
     RoleStarted(RoleId),
     ToolCalled(String),
     RoleFinished { role: RoleId, steps: usize, error: bool },
+    /// A role's `delegate_task` call passed validation and is about to run
+    /// its own bounded sub-loop. `objective` is clipped for display -
+    /// terminals don't want a 3,000-character line.
+    DelegateStarted { parent: RoleId, objective: String },
+    /// A tool call made *inside* a delegated sub-task, not by the parent
+    /// role directly - kept distinct from `ToolCalled` so a renderer can
+    /// nest/indent it under the `DelegateStarted` it belongs to, the way
+    /// this UI's own trail does, instead of flattening it into the parent's
+    /// own tool-call list with no indication of where it actually came from.
+    DelegatedToolCalled(String),
+    /// The delegated sub-task returned (successfully or not).
+    DelegateFinished { steps: usize, error: bool },
 }
 
 /// Where progress events go. `None` means nobody is watching.
@@ -45,6 +57,17 @@ pub struct FlowOptions {
     pub roles: Vec<RoleId>,
     /// Override the per-role step cap (clamped down, never up, per role).
     pub max_steps: Option<usize>,
+    /// Additional steps earned by a role from how much of the operator's own
+    /// instruction (`lantern ask`) pointed at it - see
+    /// `intent::Intent::step_boosts`. Raises a role's budget above its
+    /// static default, unlike `max_steps`, which only ever lowers it; an
+    /// explicit `max_steps` still wins as the hard ceiling over both.
+    pub extra_steps: Vec<(RoleId, usize)>,
+    /// What kind of engagement the operator's own instruction sounds like -
+    /// see `intent::Intent::engagement_profile` and
+    /// `prompts::engagement_addendum`. `General` (the default) changes
+    /// nothing about the system prompt a plain `lantern run` gets.
+    pub engagement_profile: crate::intent::EngagementProfile,
     /// Roles may stop and ask the operator a question (`ask_operator`).
     pub interactive: bool,
     /// The operator's own instruction, verbatim (`lantern ask`). Stored with
@@ -71,6 +94,8 @@ impl std::fmt::Debug for FlowOptions {
             .field("offensive", &self.offensive)
             .field("roles", &self.roles)
             .field("max_steps", &self.max_steps)
+            .field("extra_steps", &self.extra_steps)
+            .field("engagement_profile", &self.engagement_profile)
             .field("interactive", &self.interactive)
             .field(
                 "directive",
@@ -104,6 +129,8 @@ impl FlowOptions {
             offensive: false,
             roles: Vec::new(),
             max_steps: None,
+            extra_steps: Vec::new(),
+            engagement_profile: crate::intent::EngagementProfile::default(),
             interactive: false,
             directive: None,
             progress: None,
@@ -528,9 +555,19 @@ async fn run_role(
     )?;
     agent.db.task_started(task)?;
 
+    let boost = opts
+        .extra_steps
+        .iter()
+        .find(|(r, _)| *r == id)
+        .map(|(_, n)| *n)
+        .unwrap_or(0);
+    let boosted_default = meta.max_steps + boost;
     let max_steps = match opts.max_steps {
-        Some(n) => meta.max_steps.min(n.max(1)),
-        None => meta.max_steps,
+        // An explicit --steps is the operator's own hard ceiling and still
+        // wins over a vocabulary-earned boost, the same way --offensive is
+        // always the final word over what a prompt asks for.
+        Some(n) => boosted_default.min(n.max(1)),
+        None => boosted_default,
     };
     let budget = Duration::from_secs(
         max_steps as u64 * (agent.config.llm.timeout_secs.saturating_add(60)),
@@ -605,7 +642,13 @@ async fn role_loop(
     opts: &FlowOptions,
 ) -> anyhow::Result<(String, usize)> {
     let meta = role(id);
-    let system = prompts::system(meta, target, scope, tool_ctx.offensive);
+    let system = prompts::system(
+        meta,
+        target,
+        scope,
+        tool_ctx.offensive,
+        opts.engagement_profile,
+    );
     let mut window = ContextWindow::new(
         agent.config.token_budget,
         agent.config.summarize_at,
@@ -613,9 +656,21 @@ async fn role_loop(
     );
     window.push(Message::user(objective));
 
-    let defs = agent.registry.defs();
+    // Scoped to this role's own focus: every role already pays this cost on
+    // every request, and `meta.focus` is exactly what the system prompt's
+    // `YOUR TOOLS:` line already told the model it may use - sending schemas
+    // for everything else is pure overhead that only grows as the registry
+    // does. A role with no declared focus (there are none on the tool-calling
+    // path today) falls back to the full registry rather than silently
+    // seeing nothing.
+    let defs = agent.registry.defs_for(meta.focus);
     let mut text = String::new();
     let mut steps = 0usize;
+    // Shared across every `delegate_task` call this role makes this
+    // invocation - see `run_delegate_task`. Decremented by whatever a
+    // sub-task actually spent, so a role that calls it several times still
+    // cannot multiply its own step budget unboundedly.
+    let mut delegate_budget = lantern_tools::tools::delegate::TOTAL_STEP_BUDGET;
 
     while steps < max_steps {
         if aborted(opts) {
@@ -624,8 +679,16 @@ async fn role_loop(
         // Steering typed mid-flow joins the working set at the next boundary,
         // so the roles still to run act on it.
         if let Some(queue) = &opts.steering {
-            let mut queued = queue.lock().unwrap_or_else(|e| e.into_inner());
-            for line in queued.drain(..) {
+            // Drain into a local Vec and drop the lock before the first
+            // `.await`: holding a std::sync::Mutex guard across an await
+            // point blocks whoever next tries to lock it (chat's UI thread
+            // pushing a newly typed steering line) for the duration of a
+            // model/network call rather than a pointer swap.
+            let lines: Vec<String> = {
+                let mut queued = queue.lock().unwrap_or_else(|e| e.into_inner());
+                queued.drain(..).collect()
+            };
+            for line in lines {
                 memory.remember("operator", &line).await;
                 window.push(Message::user(format!("OPERATOR (live steering): {line}")));
             }
@@ -661,20 +724,41 @@ async fn role_loop(
                 anyhow::bail!("aborted by operator");
             }
             emit(opts, ProgressEvent::ToolCalled(call.name.clone()));
-            let body = match agent
-                .registry
-                .execute(&call.name, call.args(), tool_ctx)
+            // `delegate_task` is intercepted here, before the registry: the
+            // real work needs to call the model, which lantern-tools has no
+            // access to. This is the only place a delegated sub-task can be
+            // started - see delegate.rs for why its own registry body fails
+            // closed - and the only place `delegate_budget` is spent.
+            let body = if call.name == "delegate_task" {
+                run_delegate_task(
+                    agent,
+                    id,
+                    target,
+                    scope,
+                    meta.focus,
+                    tool_ctx,
+                    memory,
+                    opts,
+                    call.args(),
+                    &mut delegate_budget,
+                )
                 .await
-            {
-                Ok(out) => {
-                    let data = lantern_core::text_clip(&out.data.to_string(), 500);
-                    let combined = format!("{}\n\nDATA: {}", out.summary, data);
-                    if out.summary.len() > 40 {
-                        memory.remember("tool", &out.summary).await;
+            } else {
+                match agent
+                    .registry
+                    .execute(&call.name, call.args(), tool_ctx)
+                    .await
+                {
+                    Ok(out) => {
+                        let data = lantern_core::text_clip(&out.data.to_string(), 500);
+                        let combined = format!("{}\n\nDATA: {}", out.summary, data);
+                        if out.summary.len() > 40 {
+                            memory.remember("tool", &out.summary).await;
+                        }
+                        combined
                     }
-                    combined
+                    Err(e) => format!("TOOL ERROR: {e:#}"),
                 }
-                Err(e) => format!("TOOL ERROR: {e:#}"),
             };
             window.push(Message::tool(&call.id, ContextWindow::clip(&body, 700)));
         }
@@ -701,6 +785,218 @@ async fn role_loop(
     }
 
     Ok((text, steps))
+}
+
+/// Validate a `delegate_task` call and, if it passes, run the bounded
+/// sub-task. Always returns a tool-response body (an error string on
+/// refusal, never a hard failure of the parent role) - the same contract
+/// every other tool call in this loop has.
+#[allow(clippy::too_many_arguments)]
+async fn run_delegate_task(
+    agent: &AgentCtx,
+    parent: RoleId,
+    target: &str,
+    scope: &str,
+    parent_focus: &[&str],
+    tool_ctx: &ToolCtx,
+    memory: &Memory,
+    opts: &FlowOptions,
+    args: serde_json::Value,
+    delegate_budget: &mut usize,
+) -> String {
+    let objective = match args.get("objective").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return "TOOL ERROR: delegate_task needs a non-empty `objective`".into(),
+    };
+    let requested: Vec<String> = match args.get("tools").and_then(|v| v.as_array()) {
+        Some(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        None => return "TOOL ERROR: delegate_task needs a `tools` array".into(),
+    };
+    if requested.is_empty() {
+        return "TOOL ERROR: delegate_task's `tools` array is empty - name at least one".into();
+    }
+    // The sub-task's tool set can only ever be a subset of what the parent
+    // already has - and can never include delegate_task itself, however the
+    // parent's own focus is defined, so a delegated sub-task can never
+    // delegate again. This check is what makes that true; it does not rely
+    // on the sub-loop's own tool defs happening to exclude it (though they
+    // do too - see delegated_loop).
+    let mut tools: Vec<&str> = Vec::new();
+    for want in &requested {
+        if want == "delegate_task" {
+            return "TOOL ERROR: delegate_task cannot be delegated to a sub-task".into();
+        }
+        match parent_focus.iter().find(|f| *f == want) {
+            Some(f) => tools.push(f),
+            None => {
+                return format!(
+                    "TOOL ERROR: `{want}` is not one of your own tools, so a sub-task cannot \
+                     have it either"
+                )
+            }
+        }
+    }
+    let max_steps = args
+        .get("max_steps")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(3)
+        .clamp(1, lantern_tools::tools::delegate::MAX_STEPS_PER_CALL)
+        .min(*delegate_budget);
+    if max_steps == 0 {
+        return format!(
+            "TOOL ERROR: delegated-task budget exhausted for this turn \
+             ({} steps already spent across earlier delegate_task calls)",
+            lantern_tools::tools::delegate::TOTAL_STEP_BUDGET
+        );
+    }
+
+    emit(
+        opts,
+        ProgressEvent::DelegateStarted {
+            parent,
+            objective: lantern_core::text_clip(&objective, 140),
+        },
+    );
+    // A delegated call skips Registry::execute entirely (see the comment at
+    // its call site in role_loop), which is also where every other tool
+    // call's audit event gets written - so without this, the one fact that
+    // a delegation happened at all, to whom, and with what outcome would
+    // exist only in this process's live progress stream, never in the
+    // database every other tool call lands in. Logged the same way
+    // Registry::execute logs everything else (`ctx.event`, same "tool"
+    // kind), not a parallel audit mechanism of its own.
+    tool_ctx.event(
+        "info",
+        "tool",
+        &format!("delegate_task: {parent} -> {}", lantern_core::text_clip(&objective, 200)),
+        Some(json!({"tool": "delegate_task", "parent": parent.as_str(), "tools": tools, "max_steps": max_steps})),
+    );
+    let result = delegated_loop(
+        agent, parent, target, scope, &objective, &tools, max_steps, tool_ctx, memory, opts,
+    )
+    .await;
+
+    match result {
+        Ok((text, spent)) => {
+            *delegate_budget = delegate_budget.saturating_sub(spent);
+            emit(opts, ProgressEvent::DelegateFinished { steps: spent, error: false });
+            tool_ctx.event(
+                "info",
+                "tool",
+                &format!("delegate_task: {parent} sub-task finished in {spent} step(s)"),
+                Some(json!({"tool": "delegate_task", "parent": parent.as_str(), "ok": true, "steps": spent})),
+            );
+            format!("DELEGATED SUB-TASK RESULT ({spent} step(s) spent):\n{text}")
+        }
+        Err(e) => {
+            emit(opts, ProgressEvent::DelegateFinished { steps: 0, error: true });
+            tool_ctx.event(
+                "warn",
+                "tool",
+                &format!("delegate_task: {parent} sub-task failed: {e:#}"),
+                Some(json!({"tool": "delegate_task", "parent": parent.as_str(), "ok": false})),
+            );
+            format!("TOOL ERROR: delegated sub-task failed: {e:#}")
+        }
+    }
+}
+
+/// The bounded sub-loop itself. Structurally a smaller copy of `role_loop`,
+/// not a call to it: a delegated sub-task is not a `Role` (no findings
+/// contract, no static focus list, no mission beyond the objective it was
+/// given), and keeping the two loops textually separate means the one
+/// property that matters most - this loop's own tool defs never include
+/// `delegate_task`, so a sub-task cannot delegate again - is visible by
+/// reading this function alone, not by tracing a shared one with branches.
+/// Returns (condensed answer, steps actually spent).
+#[allow(clippy::too_many_arguments)]
+async fn delegated_loop(
+    agent: &AgentCtx,
+    parent: RoleId,
+    target: &str,
+    scope: &str,
+    objective: &str,
+    tools: &[&str],
+    max_steps: usize,
+    tool_ctx: &ToolCtx,
+    memory: &Memory,
+    opts: &FlowOptions,
+) -> anyhow::Result<(String, usize)> {
+    let system = prompts::delegated_system(parent, target, scope, tool_ctx.offensive, tools);
+    let mut window = ContextWindow::new(
+        agent.config.token_budget,
+        agent.config.summarize_at,
+        agent.config.keep_recent_tokens,
+    );
+    window.push(Message::user(objective.to_string()));
+    let defs = agent.registry.defs_for(tools);
+    let mut text = String::new();
+    let mut steps = 0usize;
+
+    while steps < max_steps {
+        if aborted(opts) {
+            anyhow::bail!("aborted by operator");
+        }
+        let request = ChatRequest::new(window.render(&system))
+            .with_tools(defs.clone())
+            .max_tokens(agent.config.llm.max_output_tokens)
+            .temperature(agent.config.llm.temperature);
+        agent.counters.context(window.tokens());
+        let reply = agent
+            .chat(request)
+            .await
+            .with_context(|| format!("delegated sub-task call for {parent}"))?;
+        steps += 1;
+
+        if !reply.message.content.trim().is_empty() {
+            text.push_str(&reply.message.content);
+            text.push('\n');
+        }
+        if reply.message.tool_calls.is_empty() {
+            window.push(Message::assistant(reply.message.content.clone()));
+            break;
+        }
+        window.push(Message::assistant_with_calls(
+            reply.message.content.clone(),
+            reply.message.tool_calls.clone(),
+        ));
+
+        for call in &reply.message.tool_calls {
+            if aborted(opts) {
+                anyhow::bail!("aborted by operator");
+            }
+            // Defense in depth: `defs` above never includes delegate_task,
+            // so the model has no schema for it here - but refuse by name
+            // too rather than trust that alone.
+            if call.name == "delegate_task" {
+                window.push(Message::tool(
+                    &call.id,
+                    "TOOL ERROR: delegation is not available inside a delegated sub-task",
+                ));
+                continue;
+            }
+            emit(opts, ProgressEvent::DelegatedToolCalled(call.name.clone()));
+            let body = match agent
+                .registry
+                .execute(&call.name, call.args(), tool_ctx)
+                .await
+            {
+                Ok(out) => {
+                    let data = lantern_core::text_clip(&out.data.to_string(), 500);
+                    let combined = format!("{}\n\nDATA: {}", out.summary, data);
+                    if out.summary.len() > 40 {
+                        memory.remember("delegated-tool", &out.summary).await;
+                    }
+                    combined
+                }
+                Err(e) => format!("TOOL ERROR: {e:#}"),
+            };
+            window.push(Message::tool(&call.id, ContextWindow::clip(&body, 700)));
+        }
+    }
+
+    Ok((lantern_core::text_clip(&text, 1_500), steps))
 }
 
 /// Review every finding for evidence quality and severity accuracy. Never
@@ -975,5 +1271,135 @@ mod tests {
         assert!(log.contains("RoleStarted(Researcher)"), "{log}");
         assert!(log.contains("ToolCalled(\"port_scan\")"), "{log}");
         assert!(log.contains("RoleFinished"), "{log}");
+    }
+
+    // --- delegate_task -----------------------------------------------------
+
+    #[tokio::test]
+    async fn a_role_can_delegate_a_bounded_sub_task_end_to_end() {
+        // researcher's own call -> delegate_task; the delegated sub-loop's
+        // one call -> plain text, no further tool calls, ending the
+        // sub-task at 1 step; back in the role's own loop -> findings.
+        let agent = scripted(vec![
+            Scripted::ToolCall {
+                name: "delegate_task".into(),
+                arguments: r#"{"objective":"resolve example.com","tools":["dns_lookup"],"max_steps":2}"#.into(),
+            },
+            Scripted::Text("sub-task done: A record found".into()),
+            findings_reply(),
+        ]);
+        let opts = FlowOptions::new("127.0.0.1", "127.0.0.1, localhost")
+            .roles(vec![RoleId::Researcher]);
+        let out = run_flow(&agent, opts).await.expect("flow runs");
+        assert!(out.findings >= 1, "the role still reaches its own findings: {out:?}");
+
+        // A delegation skips Registry::execute, which is also where every
+        // other tool call's audit event gets written - so this is the one
+        // thing that has to be asserted directly rather than inherited for
+        // free: the database, not just the live progress stream, must show
+        // that a delegation happened and how it ended.
+        let events = agent.db.events_for_flow(&out.flow_id).unwrap();
+        assert!(
+            events.iter().any(|e| e.message.starts_with("delegate_task: researcher ->")),
+            "no start event for the delegation: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e.message.contains("sub-task finished in 1 step")),
+            "no finish event for the delegation: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_cannot_grant_a_tool_the_parent_does_not_have() {
+        let agent = scripted(vec![]);
+        let tool_ctx = agent.tool_ctx(None, false).unwrap();
+        let memory = agent.memory("test");
+        let opts = FlowOptions::new("127.0.0.1", "127.0.0.1");
+        let mut budget = lantern_tools::tools::delegate::TOTAL_STEP_BUDGET;
+
+        let body = run_delegate_task(
+            &agent,
+            RoleId::Researcher,
+            "127.0.0.1",
+            "127.0.0.1",
+            role(RoleId::Researcher).focus,
+            &tool_ctx,
+            &memory,
+            &opts,
+            serde_json::json!({"objective": "x", "tools": ["host_msfconsole"]}),
+            &mut budget,
+        )
+        .await;
+        assert!(body.contains("TOOL ERROR"), "{body}");
+        assert!(body.contains("host_msfconsole"), "{body}");
+        assert_eq!(budget, lantern_tools::tools::delegate::TOTAL_STEP_BUDGET, "a refused call spends nothing");
+    }
+
+    #[tokio::test]
+    async fn delegation_cannot_delegate_itself() {
+        let agent = scripted(vec![]);
+        let tool_ctx = agent.tool_ctx(None, false).unwrap();
+        let memory = agent.memory("test");
+        let opts = FlowOptions::new("127.0.0.1", "127.0.0.1");
+        let mut budget = lantern_tools::tools::delegate::TOTAL_STEP_BUDGET;
+
+        let body = run_delegate_task(
+            &agent,
+            RoleId::Pentester,
+            "127.0.0.1",
+            "127.0.0.1",
+            role(RoleId::Pentester).focus,
+            &tool_ctx,
+            &memory,
+            &opts,
+            serde_json::json!({"objective": "x", "tools": ["delegate_task"]}),
+            &mut budget,
+        )
+        .await;
+        assert!(body.contains("TOOL ERROR"), "{body}");
+        assert!(body.to_lowercase().contains("cannot be delegated"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn empty_objective_and_empty_tools_are_both_refused() {
+        let agent = scripted(vec![]);
+        let tool_ctx = agent.tool_ctx(None, false).unwrap();
+        let memory = agent.memory("test");
+        let opts = FlowOptions::new("127.0.0.1", "127.0.0.1");
+
+        let mut budget = lantern_tools::tools::delegate::TOTAL_STEP_BUDGET;
+        let body = run_delegate_task(
+            &agent, RoleId::Researcher, "127.0.0.1", "127.0.0.1",
+            role(RoleId::Researcher).focus, &tool_ctx, &memory, &opts,
+            serde_json::json!({"objective": "  ", "tools": ["dns_lookup"]}),
+            &mut budget,
+        ).await;
+        assert!(body.contains("objective"), "{body}");
+
+        let mut budget = lantern_tools::tools::delegate::TOTAL_STEP_BUDGET;
+        let body = run_delegate_task(
+            &agent, RoleId::Researcher, "127.0.0.1", "127.0.0.1",
+            role(RoleId::Researcher).focus, &tool_ctx, &memory, &opts,
+            serde_json::json!({"objective": "find things", "tools": []}),
+            &mut budget,
+        ).await;
+        assert!(body.contains("TOOL ERROR"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn total_delegate_budget_is_enforced_across_calls() {
+        let agent = scripted(vec![]);
+        let tool_ctx = agent.tool_ctx(None, false).unwrap();
+        let memory = agent.memory("test");
+        let opts = FlowOptions::new("127.0.0.1", "127.0.0.1");
+        let mut budget = 0usize; // already exhausted by earlier (hypothetical) calls
+
+        let body = run_delegate_task(
+            &agent, RoleId::Researcher, "127.0.0.1", "127.0.0.1",
+            role(RoleId::Researcher).focus, &tool_ctx, &memory, &opts,
+            serde_json::json!({"objective": "find things", "tools": ["dns_lookup"]}),
+            &mut budget,
+        ).await;
+        assert!(body.contains("budget exhausted"), "{body}");
     }
 }

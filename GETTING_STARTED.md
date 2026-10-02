@@ -31,7 +31,7 @@ sudo apt install build-essential libssl-dev pkg-config
 git clone https://github.com/ianclemence/lantern.git
 cd lantern
 make          # release build, then on-disk and runtime footprint
-make test     # 234 tests, no API spend (scripted provider)
+make test     # 275+ tests, no API spend (scripted provider)
 ```
 
 If `cargo` is not on `PATH` yet, prefix with `export PATH="$HOME/.cargo/bin:$PATH"`
@@ -123,7 +123,7 @@ lantern doctor
   disk      : 6.55 GB free of 30.79 GB (floor keeps 6.16 GB free)
   generation: deepseek / deepseek-flash @ https://api.deepseek.com [NO KEY - run `lantern setup`]
   embeddings: ollama nomic-embed-text @ http://127.0.0.1:11434 - 768-dim
-  tools     : 12 native, allowlist: nmap sqlmap nikto hydra tcpdump nuclei msfconsole john bwrap
+  tools     : 15 native, allowlist: nmap sqlmap nikto hydra tcpdump nuclei msfconsole john bwrap testssl.sh gobuster amass
   runtime   : concurrency 3 | task timeout 120s | child 512 MB / 60 CPU-s | token budget 6000
   warnings  :
     - no generation key: runs are limited to --dry-run
@@ -185,7 +185,35 @@ stdin. The full text is stored with the flow and each role sees its head, so a
 intent card says what was understood - and the safety rule is that the prompt
 can only restrain `--offensive`, never grant it: ask for exploitation without
 the flag and you get reconnaissance plus the flag named; pass the flag with a
-defensive-only prompt and the prompt wins, loudly in both cases.
+defensive-only prompt and the prompt wins, loudly in both cases. That rule is
+never relaxed, however the instruction is phrased - it is what keeps a run
+from being steered into exploitation by the prompt's own wording, which
+includes wording that arrived inside a page the agent fetched, not only what
+the operator typed.
+
+What the prompt *can* do is shape how the fixed pipeline spends its budget.
+Every role still runs - a prompt never removes one - but a role whose
+territory the instruction repeatedly names earns up to 4 extra tool-calling
+steps over its default (`vocabulary points at ...` / `step budget : ...` in
+the intent card say which ones and why). Mentioning "GraphQL", "IAM role",
+"Kerberoasting", "JWT", "container escape" or similar once is enough to steer
+the pentester role's attention there; naming several such checks across a
+longer framework is what earns the extra steps, capped so repeating a
+keyword cannot buy an unbounded budget. An explicit `--steps` is still the
+hard ceiling over all of it.
+
+A prompt also shapes *how the model is told to think*, through an
+engagement profile detected from the same vocabulary (web app / API /
+internal-AD / cloud / network - `profile : ...` in the intent card when one
+is detected). Each profile adds a short, specific addendum to the system
+prompt: which taxonomy to structure findings against (OWASP, MITRE ATT&CK,
+CIS - whatever that engagement type's own field uses), and - just as
+important - which checks this build cannot actually run for that profile, so
+the model says "I don't have a tool for that" instead of describing a
+GraphQL or IAM-policy check it never performed. A short instruction with no
+strong signal (most of them) gets the same generic framing this always had -
+the addendum is empty, byte for byte, unless the vocabulary actually points
+somewhere specific.
 
 `chat` is the same flow behind a conversational screen: the transcript stays
 in the terminal's scrollback while a small viewport shows status, live role
@@ -253,7 +281,7 @@ The defaults these lines are there to check:
 | knob | default | where the number came from |
 |---|---|---|
 | steps per role | orchestrator 1, planner 1, researcher 6, coder 2, pentester 6, reflector 1 (17 max) | the real read-only run above used 16 of 17 |
-| context budget | 6,000 tokens (compress at 4,500, keep 1,500) | a call starts with 3,034-3,290 tokens before the conversation: 2,770 for the 20 tool schemas sent on every request, 264-520 for the system prompt |
+| context budget | 6,000 tokens (compress at 4,500, keep 1,500) | a call starts at 721-3,193 tokens before the conversation, depending on the role: each role's tool-calling loop only pays for the schemas of the tools in its own focus list (`Registry::defs_for`), not the full registry - `cargo test -p lantern-agent --test measure_prompts -- --nocapture` prints the live per-role numbers |
 | `LANTERN_TASK_TIMEOUT_SECS` | 120 s, for the sandboxed analysis script | longest script actually recorded: 33 ms, zero timeouts - a safety cap, not a target |
 
 The first run with a real key gives you the cost number; the lines above are
@@ -263,7 +291,16 @@ how the next change gets made from evidence rather than from a guess.
 
 ```sh
 lantern gc      # compress artifacts, prune traces and logs, vacuum when low on space
+lantern delete flw_abc123 --yes   # permanently remove one flow now, rather than wait for retention
 ```
+
+`/new` in `lantern chat` does the same "start over" without leaving the
+session: it resets target/scope/roles/offensive/dry-run/steps to blank for
+the next engagement, without touching any flow already recorded. `/delete
+<flow-id> yes` removes one from inside chat the same way the CLI command
+does - see the README's [Session
+lifecycle](README.md#session-lifecycle-create-read-update-delete) section
+for the full picture.
 
 **Precedence: environment > `~/.config/lantern` files > preset defaults.**
 

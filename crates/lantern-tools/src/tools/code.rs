@@ -108,6 +108,7 @@ impl Tool for CodeRun {
                     timeout: Duration::from_secs(ctx.config.task_timeout_secs),
                     max_output_bytes: ctx.config.max_output_bytes,
                     offensive: false,
+                    resolved_ips: &[],
                 },
                 ctx,
             )

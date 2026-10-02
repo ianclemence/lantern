@@ -159,6 +159,25 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
             names.join(", ")
         );
     }
+    if parsed.engagement_profile != intent::EngagementProfile::General {
+        println!(
+            "profile     : {:?} (shapes the system prompt's taxonomy and honesty \
+             boundary, not tool access or scope)",
+            parsed.engagement_profile
+        );
+    }
+    let step_boosts = parsed.step_boosts();
+    if !step_boosts.is_empty() {
+        let parts: Vec<String> = step_boosts
+            .iter()
+            .map(|(r, n)| format!("{r} +{n}"))
+            .collect();
+        println!(
+            "step budget : {} (more of the instruction pointed at these roles; \
+             pass --steps to set a hard ceiling instead)\n",
+            parts.join(", ")
+        );
+    }
 
     let roles = crate::run::parse_roles(args.roles.as_deref())?;
     let agent = AgentCtx::new(config, &args.scope, args.dry_run)?;
@@ -168,6 +187,8 @@ pub async fn run(config: Config, args: Args) -> anyhow::Result<()> {
         .interactive(args.interactive)
         .roles(roles);
     opts.max_steps = args.steps;
+    opts.extra_steps = step_boosts;
+    opts.engagement_profile = parsed.engagement_profile;
     opts.directive = Some(prompt);
 
     if args.interactive {

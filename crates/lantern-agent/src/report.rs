@@ -187,7 +187,7 @@ pub fn build(db: &Db, flow_id: &str) -> anyhow::Result<String> {
     if commands.is_empty() {
         s.push_str("_No host binaries were invoked._\n\n");
     } else {
-        s.push_str("| Tool | Command | Exit | Duration |\n|---|---|---|---|\n");
+        s.push_str("| Tool | Command | Resolved | Exit | Duration |\n|---|---|---|---|---|\n");
         for c in &commands {
             let mut line = String::new();
             line.push_str(&c.binary);
@@ -199,10 +199,20 @@ pub fn build(db: &Db, flow_id: &str) -> anyhow::Result<String> {
                     line.push_str(a);
                 }
             }
+            // DNS resolved immediately before this command ran, for a
+            // hostname target — a divergence from what `--scope` declared
+            // (DNS drift between scope time and execution time) is visible
+            // here without digging through the trace file.
+            let resolved = if c.resolved_ips.is_empty() {
+                "-".to_string()
+            } else {
+                c.resolved_ips.join(", ")
+            };
             s.push_str(&format!(
-                "| {} | `{}` | {} | {} ms |\n",
+                "| {} | `{}` | {} | {} | {} ms |\n",
                 c.tool,
                 line.replace('|', "/"),
+                resolved,
                 c.exit_code
                     .map(|e| e.to_string())
                     .unwrap_or_else(|| "timeout".into()),

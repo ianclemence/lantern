@@ -5,6 +5,22 @@
 //! every single request. This test measures both so prompt bloat is caught
 //! here instead of at the end of a bill, and prints the numbers with
 //! `cargo test --test measure_prompts -- --nocapture`.
+//!
+//! Tool schemas are scoped to each role's own `focus` (`Registry::defs_for`),
+//! matching what `run_role` actually sends - not the whole registry. That
+//! matters here specifically: a flat "every tool, every role" measurement
+//! means the fixed overhead grows every time *any* tool is added, even one
+//! only the pentester role ever sees, and this test would eventually fail
+//! for a researcher-only addition that costs the researcher role nothing.
+//!
+//! Orchestrator and planner are measured separately, not folded into
+//! `worst`: they have an empty `focus` and never call `with_tools` at all
+//! (`plan_phase`/`planner_phase` use a plain `agent.complete()`, not
+//! `role_loop`) - `defs_for(&[])`'s "empty focus falls back to everything"
+//! rule exists for a future caller with no declared focus, not for these
+//! two, whose real tool-schema cost on every request is zero. Measuring
+//! them against the full registry would make this test fail every time any
+//! tool is added anywhere, for a cost neither role ever actually pays.
 
 use lantern_agent::prompts;
 use lantern_agent::roles::roles;
@@ -15,30 +31,48 @@ use lantern_tools::registry::Registry;
 fn the_fixed_overhead_of_a_call_stays_small() {
     let cfg = Config::load().unwrap();
     let reg = Registry::new(&cfg).unwrap();
-    let defs = reg.defs();
-    let schema: usize = defs
-        .iter()
-        .map(|d| (d.wire().to_string().len() + 3) / 4)
-        .sum();
-
+    let all = reg.defs();
     println!(
-        "tool schemas : {} tools, {} chars (~{} tokens) sent on every request",
-        defs.len(),
-        defs.iter().map(|d| d.wire().to_string().len()).sum::<usize>(),
-        schema
+        "registry     : {} tools total (not all sent to every role - see below)",
+        all.len()
     );
 
     let scope = "example.com, 104.20.23.154/32, 172.66.147.243/32";
     let mut worst = 0usize;
     for r in roles() {
-        let system = prompts::system(r, "example.com", scope, false);
-        let overhead = schema + (system.len() + 3) / 4;
+        let system = prompts::system(
+            r,
+            "example.com",
+            scope,
+            false,
+            lantern_agent::intent::EngagementProfile::General,
+        );
+        let sys_tokens = (system.len() + 3) / 4;
+
+        if r.focus.is_empty() {
+            // orchestrator/planner: no tool-calling loop, no schema cost -
+            // see the module doc comment for why this isn't folded into `worst`.
+            println!(
+                "role {:11}: no tool-calling loop (plain completion) + {:>4} tokens system \
+                 = {:>4} tokens before the first word",
+                r.id.as_str(),
+                sys_tokens,
+                sys_tokens
+            );
+            continue;
+        }
+
+        let defs = reg.defs_for(r.focus);
+        let schema: usize = defs.iter().map(|d| (d.wire().to_string().len() + 3) / 4).sum();
+        let overhead = schema + sys_tokens;
         worst = worst.max(overhead);
         println!(
-            "system {:11}: {:>4} tokens, {} tools focused, {:>4} tokens before the first word",
+            "role {:11}: {:>4} tool(s) focused (~{:>4} tokens) + {:>4} tokens system \
+             = {:>4} tokens before the first word",
             r.id.as_str(),
-            (system.len() + 3) / 4,
-            r.focus.len(),
+            defs.len(),
+            schema,
+            sys_tokens,
             overhead
         );
     }
@@ -49,7 +83,36 @@ fn the_fixed_overhead_of_a_call_stays_small() {
     assert!(
         worst <= 4_000,
         "the fixed overhead of a call is now {worst} tokens - either shrink the \
-         prompts or move LANTERN_TOKEN_BUDGET"
+         prompts, narrow a role's focus, or move LANTERN_TOKEN_BUDGET"
     );
-    assert!(!defs.is_empty(), "the registry lost its tools");
+    assert!(!all.is_empty(), "the registry lost its tools");
+}
+
+#[test]
+fn role_scoped_schemas_are_never_larger_than_the_full_registry() {
+    // Confirms defs_for is actually doing its job here, not just compiling:
+    // every role's scoped schema cost must be <= what sending everything
+    // would have cost, and strictly less for any role with a real focus list.
+    let cfg = Config::load().unwrap();
+    let reg = Registry::new(&cfg).unwrap();
+    let all_tokens: usize = reg
+        .defs()
+        .iter()
+        .map(|d| (d.wire().to_string().len() + 3) / 4)
+        .sum();
+    for r in roles() {
+        let scoped_tokens: usize = reg
+            .defs_for(r.focus)
+            .iter()
+            .map(|d| (d.wire().to_string().len() + 3) / 4)
+            .sum();
+        assert!(scoped_tokens <= all_tokens, "{} exceeded the full registry cost", r.id);
+        if !r.focus.is_empty() {
+            assert!(
+                scoped_tokens < all_tokens,
+                "{} has a focus list but was sent every tool's schema anyway",
+                r.id
+            );
+        }
+    }
 }

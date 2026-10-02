@@ -165,7 +165,7 @@ impl OpenAiCompat {
                 .with_context(|| format!("POST {url}"))?;
 
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::fetch::read_capped_text(resp, 16 * 1024 * 1024).await;
 
             if status.is_success() {
                 return serde_json::from_str(&text)

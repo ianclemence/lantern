@@ -55,7 +55,7 @@ impl ToolCtx {
             .timeout(std::time::Duration::from_secs(20))
             .connect_timeout(std::time::Duration::from_secs(8))
             .redirect(reqwest::redirect::Policy::limited(5))
-            .user_agent(concat!("lantern/", env!("CARGO_PKG_VERSION")))
+            .user_agent(config.user_agent.clone())
             .build()
             .context("building http client")?;
 

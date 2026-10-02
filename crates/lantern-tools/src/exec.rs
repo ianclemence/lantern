@@ -25,6 +25,11 @@ pub struct ExecRequest<'a> {
     /// True for binaries that perform active attacks: refused unless the flow
     /// was started with `--offensive`.
     pub offensive: bool,
+    /// DNS records resolved for the target immediately before this call, so
+    /// the audit row shows what address was actually reachable at execution
+    /// time rather than only the hostname declared in scope. Empty when the
+    /// target was already a literal IP/CIDR or resolution was not applicable.
+    pub resolved_ips: &'a [String],
 }
 
 /// Boxed, `Send` future used by the tool trait (no `async-trait` dependency).
@@ -240,6 +245,7 @@ pub async fn run_path(
         duration_ms: outcome.duration_ms as i64,
         stdout_path: None,
         stderr_path: None,
+        resolved_ips: req.resolved_ips.to_vec(),
     });
 
     Ok(outcome)
@@ -327,6 +333,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_output_bytes: 64 * 1024,
             offensive: false,
+            resolved_ips: &[],
         }
     }
 
@@ -378,6 +385,7 @@ mod tests {
                 timeout: Duration::from_millis(300),
                 max_output_bytes: 1024,
                 offensive: false,
+                resolved_ips: &[],
             },
             Path::new("/bin/sleep"),
             &c,
@@ -417,6 +425,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 max_output_bytes: 4_096,
                 offensive: false,
+                resolved_ips: &[],
             },
             Path::new("/bin/cat"),
             &c,
@@ -446,6 +455,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 max_output_bytes: 64 * 1024,
                 offensive: false,
+                resolved_ips: &[],
             },
             Path::new("/usr/bin/env"),
             &c,

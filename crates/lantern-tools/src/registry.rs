@@ -81,6 +81,10 @@ impl Registry {
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::tools::port_scan::PortScan),
             Arc::new(crate::tools::dns::DnsLookup),
+            Arc::new(crate::tools::subdomains::SubdomainEnum),
+            Arc::new(crate::tools::waf_fingerprint::WafFingerprint),
+            Arc::new(crate::tools::secret_scan::SecretScan),
+            Arc::new(crate::tools::delegate::DelegateTask),
             Arc::new(crate::tools::http_probe::HttpProbe),
             Arc::new(crate::tools::tls_inspect::TlsInspect),
             Arc::new(crate::tools::whois::Whois),
@@ -134,6 +138,26 @@ impl Registry {
     pub fn defs(&self) -> Vec<ToolDef> {
         self.tools
             .iter()
+            .map(|t| ToolDef::new(t.name(), t.description(), t.parameters()))
+            .collect()
+    }
+
+    /// Model-facing function definitions, filtered to the names in `focus`.
+    /// A role's own tool-calling loop uses this rather than `defs()`: every
+    /// request already pays this cost, so a role carrying schemas for tools
+    /// it is told (in `YOUR TOOLS:`) it may not use is pure waste - and as
+    /// the registry grows, a flat `defs()` on every call means every role's
+    /// fixed overhead grows with tools that role never touches. Empty
+    /// `focus` falls back to every definition (orchestrator/planner never
+    /// call this - they make no tool calls at all - but a future caller with
+    /// no declared focus should see everything rather than nothing).
+    pub fn defs_for(&self, focus: &[&str]) -> Vec<ToolDef> {
+        if focus.is_empty() {
+            return self.defs();
+        }
+        self.tools
+            .iter()
+            .filter(|t| focus.contains(&t.name()))
             .map(|t| ToolDef::new(t.name(), t.description(), t.parameters()))
             .collect()
     }
@@ -215,6 +239,10 @@ mod tests {
         for name in [
             "port_scan",
             "dns_lookup",
+            "subdomain_enum",
+            "waf_fingerprint",
+            "secret_scan",
+            "delegate_task",
             "http_probe",
             "tls_inspect",
             "whois",
@@ -239,6 +267,26 @@ mod tests {
         let before = names.clone();
         names.dedup();
         assert_eq!(before, names, "duplicate tool names");
+    }
+
+    #[test]
+    fn defs_for_filters_to_the_given_focus() {
+        let (reg, _ctx) = make(false, "nmap,sqlmap");
+        let all = reg.defs();
+        let scoped = reg.defs_for(&["port_scan", "dns_lookup"]);
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().all(|d| d.name == "port_scan" || d.name == "dns_lookup"));
+        assert!(scoped.len() < all.len(), "a focused set must be smaller than the full registry");
+
+        // Empty focus falls back to everything (no caller currently passes
+        // this, but it must fail open to "see everything" rather than
+        // silently hiding every tool from a role nobody scoped).
+        assert_eq!(reg.defs_for(&[]).len(), all.len());
+
+        // A name not in the registry at all is simply absent from the
+        // result, not an error.
+        let scoped = reg.defs_for(&["port_scan", "no_such_tool"]);
+        assert_eq!(scoped.len(), 1);
     }
 
     #[test]

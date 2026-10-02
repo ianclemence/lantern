@@ -170,17 +170,28 @@ pub fn startup_line(config: &Config, budget: &Budget) -> String {
 /// be blocked on a machine that is already configured.
 pub fn check_floor(config: &Config) -> Result<FsStat> {
     let fs = FsStat::for_path(&config.paths.root)?;
-    let floor = fs.floor_bytes(config.floor_percent);
+    check_floor_against(fs, config.floor_percent)?;
+    Ok(fs)
+}
+
+/// The pure comparison `check_floor` makes, split out so it can be tested
+/// against a constructed `FsStat` instead of this machine's real free space.
+/// A hermetic sandbox or CI runner can legitimately have less than the
+/// device's 20% floor free regardless of what `lantern` itself is doing, so a
+/// test that calls real `statvfs` and asserts the result is an environment
+/// fact, not a property of this code — see `floor_check_logic` below.
+fn check_floor_against(fs: FsStat, floor_percent: u8) -> Result<()> {
+    let floor = fs.floor_bytes(floor_percent);
     if fs.free_bytes < floor {
         return Err(crate::CoreError::BudgetExceeded(format!(
             "filesystem has {:.2} GB free but the {:.1}% floor requires {:.2} GB — \
              free space before running `lantern setup`",
             fs.free_bytes as f64 / 1e9,
-            config.floor_percent,
+            floor_percent,
             floor as f64 / 1e9
         )));
     }
-    Ok(fs)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -241,9 +252,32 @@ mod tests {
         assert!(line.contains("floor"));
     }
 
+    /// Pure logic, independent of this machine's actual free space: a sandbox
+    /// or CI runner can legitimately sit under the 20% floor without that
+    /// being a defect in `lantern`. (A previous version of this test called
+    /// the real `check_floor` and asserted it passed on whatever host ran the
+    /// suite, which is exactly the kind of environment-dependent assertion
+    /// this split exists to avoid.)
     #[test]
-    fn floor_check_passes_here() {
+    fn floor_check_logic() {
+        let comfortable = FsStat { total_bytes: 100_000_000_000, free_bytes: 50_000_000_000 };
+        assert!(check_floor_against(comfortable, 20).is_ok());
+
+        let under_floor = FsStat { total_bytes: 100_000_000_000, free_bytes: 10_000_000_000 };
+        let err = check_floor_against(under_floor, 20).unwrap_err();
+        assert!(err.to_string().contains("floor"), "{err}");
+
+        // Exactly at the floor is not below it.
+        let exact = FsStat { total_bytes: 100_000_000_000, free_bytes: 20_000_000_000 };
+        assert!(check_floor_against(exact, 20).is_ok());
+    }
+
+    /// `check_floor` itself still works end to end against the real
+    /// filesystem; it just must not assert a specific pass/fail outcome that
+    /// depends on how much space happens to be free wherever tests run.
+    #[test]
+    fn floor_check_runs_against_the_real_filesystem() {
         let config = test_config();
-        assert!(check_floor(&config).is_ok());
+        let _ = check_floor(&config);
     }
 }

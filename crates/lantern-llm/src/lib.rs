@@ -7,6 +7,7 @@
 pub mod anthropic;
 pub mod context;
 pub mod embed;
+pub mod fetch;
 pub mod mock;
 pub mod openai_compat;
 pub mod provider;

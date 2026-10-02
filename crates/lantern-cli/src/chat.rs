@@ -11,7 +11,7 @@
 //! from chat always run non-interactively - steer them with a typed line
 //! while they work instead.
 
-use lantern_agent::{intent, run_flow, AgentCtx, FlowOptions, ProgressEvent};
+use lantern_agent::{intent, run_flow, AgentCtx, FlowOptions, ProgressEvent, RoleId};
 use lantern_core::budget::{dir_size, Budget};
 use lantern_core::config::Config;
 use lantern_core::retention;
@@ -73,12 +73,26 @@ struct Composer {
     saved: String,
 }
 
+/// Largest byte index `<= i` that lands on a `char` boundary of `s`.
+/// Equivalent to the standard library's `str::floor_char_boundary`, which
+/// stabilized in Rust 1.91 - after this project's declared MSRV of 1.85
+/// (`Cargo.toml`, README). Reimplemented here rather than relying on a
+/// toolchain newer than the one the project claims to support; `0` is
+/// always a boundary, so the loop terminates.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut j = i;
+    while j > 0 && !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
 impl Composer {
     fn floor(&mut self) {
-        self.cursor = self
-            .text
-            .floor_char_boundary(self.cursor)
-            .min(self.text.len());
+        self.cursor = floor_char_boundary(&self.text, self.cursor).min(self.text.len());
     }
 
     fn insert(&mut self, s: &str) {
@@ -194,10 +208,7 @@ impl Composer {
 
     /// Display width of the text before the cursor (for cursor placement).
     fn cursor_width(&self) -> usize {
-        let end = self
-            .text
-            .floor_char_boundary(self.cursor)
-            .min(self.text.len());
+        let end = floor_char_boundary(&self.text, self.cursor).min(self.text.len());
         UnicodeWidthStr::width(&self.text[..end])
     }
 }
@@ -218,7 +229,9 @@ const COMMANDS: &[PaletteCmd] = &[
     PaletteCmd { name: "offensive", desc: "gated tools on|off", needs_args: true },
     PaletteCmd { name: "dry-run", desc: "scripted runs on|off", needs_args: true },
     PaletteCmd { name: "steps", desc: "cap steps per role (/steps 4)", needs_args: true },
+    PaletteCmd { name: "new", desc: "start a fresh session (clears target/scope/roles)", needs_args: false },
     PaletteCmd { name: "flows", desc: "list recorded flows", needs_args: false },
+    PaletteCmd { name: "delete", desc: "permanently remove a flow (/delete flw_... yes)", needs_args: true },
     PaletteCmd { name: "clear", desc: "clear the screen", needs_args: false },
     PaletteCmd { name: "quit", desc: "exit", needs_args: false },
 ];
@@ -447,7 +460,38 @@ fn on_progress(ui: &mut Ui, ev: ProgressEvent) {
             let mark = if error { "!" } else { "✓" };
             push_trail(ui, format!("{mark} {} · {steps} steps", role.as_str()));
         }
+        // Nested one level deeper than a plain tool call, with its own
+        // glyphs, so a delegated sub-task reads as a distinct block in the
+        // trail - the same thing Claude Code's Task tool or opencode's
+        // sub-agent panels show, just inline rather than collapsible: this
+        // viewport is six rows, not a scrollback pane. Line text lives in
+        // pure functions below so it is tested directly, the same way
+        // `wrap_line`/`palette_matches` are, rather than only indirectly
+        // through a live `Running`.
+        ProgressEvent::DelegateStarted { parent, objective } => {
+            push_trail(ui, delegate_started_line(parent, &objective));
+        }
+        ProgressEvent::DelegatedToolCalled(name) => {
+            run.tools += 1;
+            push_trail(ui, delegated_tool_line(&name));
+        }
+        ProgressEvent::DelegateFinished { steps, error } => {
+            push_trail(ui, delegate_finished_line(steps, error));
+        }
     }
+}
+
+fn delegate_started_line(parent: RoleId, objective: &str) -> String {
+    format!("  ↳ {} delegates: \"{objective}\"", parent.as_str())
+}
+
+fn delegated_tool_line(name: &str) -> String {
+    format!("      → {name}")
+}
+
+fn delegate_finished_line(steps: usize, error: bool) -> String {
+    let mark = if error { "!" } else { "✓" };
+    format!("  ↳ {mark} sub-task done · {steps} step(s)")
 }
 
 // --- drawing ---------------------------------------------------------------------
@@ -622,6 +666,8 @@ fn start_flow(
         .offensive(offensive)
         .roles(roles);
     opts.max_steps = ui.session.steps;
+    opts.extra_steps = parsed.step_boosts();
+    opts.engagement_profile = parsed.engagement_profile;
     opts.directive = Some(instruction.to_string());
 
     let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -656,7 +702,7 @@ fn start_flow(
 }
 
 const HELP_LINES: &[&str] = &[
-    "commands: /target /scope /roles /offensive /dry-run /steps /flows /clear /quit",
+    "commands: /target /scope /roles /offensive /dry-run /steps /new /flows /delete /clear /quit",
     "keys: Enter send · Esc abort/close · Tab complete · ↑↓ history · ^C quit",
     "while a flow runs, a typed line is noted for its later roles; Esc stops it.",
 ];
@@ -751,6 +797,24 @@ fn run_command(
                 }
             }
         }
+        "new" => {
+            // Fresh session: settings reset to blank, nothing destroyed.
+            // Every flow already run stays in the database exactly as it
+            // was - /new starts the next one, it does not undo the last.
+            let was = (ui.session.target.clone(), ui.flows);
+            ui.session = Session::default();
+            ui.trail.clear();
+            say(
+                terminal,
+                &[format!(
+                    "new session - target/scope/roles/offensive/dry-run/steps reset{}",
+                    match was.0 {
+                        Some(t) => format!(" (previous target was {t}; {} flow(s) run so far stay recorded)", was.1),
+                        None => String::new(),
+                    }
+                )],
+            )?;
+        }
         "flows" => {
             let db = Db::open(&config.paths.db())?;
             let flows = db.list_flows(10)?;
@@ -762,6 +826,18 @@ fn run_command(
                     lines.push(format!("{:<26} {:<10} {}", f.id, f.status, f.target));
                 }
                 say(terminal, &lines)?;
+            }
+        }
+        "delete" => {
+            let flow_id = args.first().copied().unwrap_or("");
+            if flow_id.is_empty() {
+                say(terminal, &["usage: /delete flw_abc123 yes".into()])?;
+            } else {
+                let yes = args.get(1).map(|a| a.eq_ignore_ascii_case("yes")).unwrap_or(false);
+                match crate::misc::delete_flow(config, flow_id, yes) {
+                    Ok(msg) => say(terminal, &[msg])?,
+                    Err(e) => say(terminal, &[format!("{e:#}")])?,
+                }
             }
         }
         "clear" => {
@@ -939,7 +1015,7 @@ fn ui_loop(config: Config, session: Session, model: String) -> anyhow::Result<()
                     let cmd = &COMMANDS[picked];
                     // Compose-first when arguments are missing: running a
                     // command that needs them would only print usage.
-                    let typed_args = query.split_whitespace().skip(1).next().is_some()
+                    let typed_args = query.split_whitespace().nth(1).is_some()
                         || ui.composer.text.contains(' ');
                     if cmd.needs_args && !typed_args {
                         ui.composer.text = format!("/{name} ", name = cmd.name);
@@ -1057,6 +1133,9 @@ fn submit_instruction(
         "as instructed"
     };
     say(terminal, &[format!("intent: {intent_line}")])?;
+    if parsed.engagement_profile != intent::EngagementProfile::General {
+        say(terminal, &[format!("profile: {:?}", parsed.engagement_profile)])?;
+    }
     if let Some(w) = crate::ask::target_warning(
         ui.session.target.as_deref().unwrap_or(""),
         &parsed.contract.target_list(),
@@ -1069,7 +1148,12 @@ fn submit_instruction(
     // a note, exactly like `ask`.
     let asks_active = parsed.wants_offensive && !parsed.defensive_only;
     if gate_warning.is_some() && asks_active && !ui.session.offensive {
-        ui.approval = Some((0, PendingFlow { instruction: line }));
+        // Default the highlight to [2] deny, not [1] allow: the module doc
+        // already calls Esc "deny-by-inaction", and a card that pre-selects
+        // the active-testing option means a reflexive Enter - the same key
+        // that submits every other line in this UI - grants it. Reaching
+        // "allow" now takes a deliberate Left/Right or typing `1`.
+        ui.approval = Some((1, PendingFlow { instruction: line }));
         return Ok(());
     }
     if let Some(w) = gate_warning {
@@ -1133,6 +1217,29 @@ mod tests {
     }
 
     #[test]
+    fn floor_char_boundary_matches_the_std_semantics_it_replaces() {
+        let s = "héllo"; // 'é' is 2 bytes, so byte 2 sits mid-character
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 1); // boundary after 'h'
+        assert_eq!(floor_char_boundary(s, 2), 1); // mid-'é': floors to before it
+        assert_eq!(floor_char_boundary(s, 3), 3); // boundary after 'é'
+        assert_eq!(floor_char_boundary(s, 100), s.len(), "past the end clamps to len");
+        assert_eq!(floor_char_boundary("", 0), 0);
+    }
+
+    #[test]
+    fn approval_card_defaults_to_deny_not_allow() {
+        // A reflexive Enter on a freshly raised approval card - the same key
+        // that submits every other line in this UI - must never grant active
+        // testing. Explicit Left (or typing 1) is what reaches "allow".
+        let mut sel = 1usize; // the default this card is raised with
+        assert_eq!(approval_key(&KeyCode::Enter, &mut sel), Some(false));
+        assert_eq!(approval_key(&KeyCode::Left, &mut sel), None);
+        assert_eq!(sel, 0);
+        assert_eq!(approval_key(&KeyCode::Enter, &mut sel), Some(true));
+    }
+
+    #[test]
     fn approval_keys_decide_or_move() {
         let mut sel = 1usize;
         assert_eq!(approval_key(&KeyCode::Char('1'), &mut sel), Some(true));
@@ -1148,5 +1255,37 @@ mod tests {
         let lines = wrap_line("aaa bb ccccc", 6);
         assert_eq!(lines, vec!["aaa bb", "ccccc"]);
         assert_eq!(wrap_line("short", 100), vec!["short"]);
+    }
+
+    #[test]
+    fn delegation_renders_as_a_distinct_nested_block() {
+        // The exact thing this exists to prove: a delegated sub-task's own
+        // tool calls must not read the same as the parent role's direct
+        // calls (indentation/glyph differ at every level), and the block
+        // must be visually bracketed by a start and an end line - the same
+        // shape Claude Code's Task tool or opencode's sub-agent panels give
+        // their own nested activity, just inline in this six-row viewport
+        // rather than a collapsible pane.
+        let start = delegate_started_line(RoleId::Researcher, "resolve example.com");
+        let nested = delegated_tool_line("dns_lookup");
+        let top_level = {
+            // `ToolCalled`'s own formatting lives inline in on_progress, not
+            // a named function - reproduced here only to assert the
+            // relationship, not duplicated as a second source of truth.
+            format!("  → {}", "dns_lookup")
+        };
+        let finish_ok = delegate_finished_line(2, false);
+        let finish_err = delegate_finished_line(0, true);
+
+        assert!(start.contains("researcher"), "{start}");
+        assert!(start.contains("resolve example.com"), "{start}");
+        assert!(nested.len() > top_level.len(), "a delegated call must nest deeper: {nested:?} vs {top_level:?}");
+        assert!(nested.trim_start() == "→ dns_lookup", "{nested}");
+        assert!(finish_ok.contains('✓') && finish_ok.contains("2 step"), "{finish_ok}");
+        assert!(finish_err.contains('!'), "{finish_err}");
+        // Start and finish lines share a marker (↳) that no plain
+        // ToolCalled/RoleFinished line uses, so the block reads as one unit.
+        assert!(start.contains('↳') && finish_ok.contains('↳'));
+        assert!(!top_level.contains('↳'));
     }
 }

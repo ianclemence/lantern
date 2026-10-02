@@ -276,8 +276,8 @@ impl Db {
             conn.execute(
                 "INSERT INTO commands
                  (flow_id, ts, tool, binary, args, cwd, exit_code, timed_out, truncated,
-                  bytes_out, duration_ms, stdout_path, stderr_path)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                  bytes_out, duration_ms, stdout_path, stderr_path, resolved_ips)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![
                     c.flow_id,
                     c.ts,
@@ -291,7 +291,8 @@ impl Db {
                     c.bytes_out,
                     c.duration_ms,
                     c.stdout_path,
-                    c.stderr_path
+                    c.stderr_path,
+                    serde_json::to_string(&c.resolved_ips).unwrap_or_else(|_| "[]".into()),
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -300,6 +301,7 @@ impl Db {
 
     fn command_from_row(r: &Row<'_>) -> rusqlite::Result<CommandRow> {
         let args: String = r.get(5)?;
+        let resolved_ips: Option<String> = r.get(14).unwrap_or(None);
         Ok(CommandRow {
             id: r.get(0)?,
             flow_id: r.get(1)?,
@@ -315,6 +317,10 @@ impl Db {
             duration_ms: r.get(11)?,
             stdout_path: r.get(12)?,
             stderr_path: r.get(13)?,
+            resolved_ips: resolved_ips
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default(),
         })
     }
 
@@ -322,7 +328,7 @@ impl Db {
         self.with(|c| {
             let mut st = c.prepare(
                 "SELECT id, flow_id, ts, tool, binary, args, cwd, exit_code, timed_out,
-                        truncated, bytes_out, duration_ms, stdout_path, stderr_path
+                        truncated, bytes_out, duration_ms, stdout_path, stderr_path, resolved_ips
                  FROM commands WHERE flow_id = ?1 ORDER BY id",
             )?;
             let rows = st.query_map(params![flow_id], Self::command_from_row)?;
@@ -482,6 +488,58 @@ impl Db {
         self.with(|c| {
             c.execute("DELETE FROM artifacts WHERE id=?1", params![id])?;
             Ok(())
+        })
+    }
+
+    /// Every row this flow owns across every table, plus the artifact rows
+    /// (so the caller can also remove the files they point at - the
+    /// database has no idea those files exist). Atomic: either every row
+    /// across every table is gone, or (on any error) none of them are -
+    /// `with` only hands out a shared `&Connection`, not a `&mut` one, so
+    /// this uses a raw `BEGIN`/`COMMIT`/`ROLLBACK` rather than
+    /// `rusqlite::Transaction`, which needs `&mut`.
+    pub fn delete_flow(&self, flow_id: &str) -> Result<Option<DeleteSummary>> {
+        self.with(|c| {
+            if c.query_row("SELECT 1 FROM flows WHERE id=?1", params![flow_id], |_| Ok(()))
+                .optional()?
+                .is_none()
+            {
+                return Ok(None);
+            }
+
+            c.execute("BEGIN", [])?;
+            let result = (|| -> rusqlite::Result<DeleteSummary> {
+                // `tasks` and `findings` carry `flow_id ... ON DELETE CASCADE`
+                // and are removed automatically when the flow row goes;
+                // `commands`, `events` and `artifacts` deliberately have no
+                // foreign key (an ad hoc/setup command can have a NULL
+                // flow_id, which a FK would forbid), so they need an
+                // explicit delete in the same transaction as the flow row.
+                let artifacts: Vec<ArtifactRow> = {
+                    let mut st = c.prepare(
+                        "SELECT id, flow_id, kind, path, bytes, created_at, expires_at, compressed
+                         FROM artifacts WHERE flow_id = ?1",
+                    )?;
+                    let rows = st.query_map(params![flow_id], Self::artifact_from_row)?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let commands = c.execute("DELETE FROM commands WHERE flow_id=?1", params![flow_id])?;
+                let events = c.execute("DELETE FROM events WHERE flow_id=?1", params![flow_id])?;
+                c.execute("DELETE FROM artifacts WHERE flow_id=?1", params![flow_id])?;
+                c.execute("DELETE FROM flows WHERE id=?1", params![flow_id])?;
+                Ok(DeleteSummary { commands, events, artifacts })
+            })();
+
+            match result {
+                Ok(summary) => {
+                    c.execute("COMMIT", [])?;
+                    Ok(Some(summary))
+                }
+                Err(e) => {
+                    let _ = c.execute("ROLLBACK", []);
+                    Err(e.into())
+                }
+            }
         })
     }
 
@@ -794,6 +852,7 @@ mod tests {
                 duration_ms: 3,
                 stdout_path: None,
                 stderr_path: None,
+                resolved_ips: vec!["10.0.0.5".into()],
             })
             .unwrap();
         assert!(id > 0);
@@ -801,6 +860,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].args, vec!["--help"]);
         assert_eq!(rows[0].exit_code, Some(0));
+        assert_eq!(rows[0].resolved_ips, vec!["10.0.0.5".to_string()]);
     }
 
     #[test]
@@ -832,5 +892,85 @@ mod tests {
         db.add_artifact(Some("flw_1"), "scan", "/tmp/b.txt", 20, 1_000_000).unwrap();
         assert_eq!(db.artifacts_expired(500).unwrap().len(), 1);
         assert_eq!(db.all_artifacts().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_flow_removes_every_owned_row_across_every_table() {
+        let db = db("delete");
+        db.create_flow("flw_d", "example.com", "example.com", &serde_json::json!({}))
+            .unwrap();
+        db.add_command(&CommandRow {
+            id: 0,
+            flow_id: Some("flw_d".into()),
+            ts: 0,
+            tool: "port_scan".into(),
+            binary: "lantern".into(),
+            args: vec![],
+            cwd: "/tmp".into(),
+            exit_code: Some(0),
+            timed_out: false,
+            truncated: false,
+            bytes_out: 0,
+            duration_ms: 0,
+            stdout_path: None,
+            stderr_path: None,
+            resolved_ips: vec![],
+        })
+        .unwrap();
+        db.add_event(Some("flw_d"), None, "info", "tool", "ran port_scan", None).unwrap();
+        db.add_artifact(Some("flw_d"), "scan", "/tmp/flw_d-out.txt", 10, 999_999_999_999)
+            .unwrap();
+        db.add_finding(
+            "flw_d",
+            &NewFinding {
+                title: "x".into(),
+                severity: "low".into(),
+                asset: "example.com".into(),
+                port: None,
+                proto: None,
+                description: "x".into(),
+                evidence: None,
+                remediation: None,
+                confidence: None,
+                judge: None,
+            },
+        )
+        .unwrap();
+
+        let summary = db.delete_flow("flw_d").unwrap().expect("flow existed");
+        assert_eq!(summary.commands, 1);
+        assert_eq!(summary.events, 1);
+        assert_eq!(summary.artifacts.len(), 1);
+        assert_eq!(summary.artifacts[0].path, "/tmp/flw_d-out.txt");
+
+        assert!(db.get_flow("flw_d").unwrap().is_none());
+        assert!(db.commands_for_flow("flw_d").unwrap().is_empty());
+        assert!(db.events_for_flow("flw_d").unwrap().is_empty());
+        assert!(db.all_artifacts().unwrap().is_empty());
+        assert!(db.findings_for_flow("flw_d").unwrap().is_empty(), "cascades via the FK");
+        assert!(db.tasks_for_flow("flw_d").unwrap().is_empty(), "cascades via the FK");
+    }
+
+    #[test]
+    fn deleting_a_flow_that_does_not_exist_is_a_clean_none() {
+        let db = db("delete-missing");
+        assert!(db.delete_flow("flw_never_existed").unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_one_flow_never_touches_another() {
+        let db = db("delete-isolated");
+        db.create_flow("flw_keep", "a.example.com", "a.example.com", &serde_json::json!({}))
+            .unwrap();
+        db.create_flow("flw_gone", "b.example.com", "b.example.com", &serde_json::json!({}))
+            .unwrap();
+        db.add_event(Some("flw_keep"), None, "info", "tool", "kept", None).unwrap();
+        db.add_event(Some("flw_gone"), None, "info", "tool", "gone", None).unwrap();
+
+        db.delete_flow("flw_gone").unwrap();
+
+        assert!(db.get_flow("flw_keep").unwrap().is_some());
+        assert_eq!(db.events_for_flow("flw_keep").unwrap().len(), 1);
+        assert!(db.get_flow("flw_gone").unwrap().is_none());
     }
 }

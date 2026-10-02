@@ -512,9 +512,7 @@ async fn live_models(p: &Provider, base_url: &str, key: &str) -> Vec<String> {
     let Ok(resp) = req.send().await else {
         return Vec::new();
     };
-    let Ok(text) = resp.text().await else {
-        return Vec::new();
-    };
+    let text = lantern_llm::fetch::read_capped_text(resp, 2 * 1024 * 1024).await;
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
@@ -596,6 +594,7 @@ mod tests {
             summarize_at: 4_500,
             keep_recent_tokens: 1_500,
             ram_per_task_bytes: 192 * 1024 * 1024,
+            user_agent: "lantern/test".into(),
             llm: lantern_core::config::LlmConfig {
                 provider: "deepseek".into(),
                 base_url: "https://api.deepseek.com".into(),

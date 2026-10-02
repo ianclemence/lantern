@@ -325,6 +325,7 @@ mod tests {
             summarize_at: 4_500,
             keep_recent_tokens: 1_500,
             ram_per_task_bytes: 192 * 1024 * 1024,
+            user_agent: "lantern/test".into(),
             llm: lantern_core::config::LlmConfig {
                 provider: "deepseek".into(),
                 base_url: "https://api.deepseek.com".into(),

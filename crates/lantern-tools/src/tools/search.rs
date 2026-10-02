@@ -109,7 +109,9 @@ async fn tavily_search(
         .send()
         .await?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    // A configured search endpoint is operator-trusted, but still an
+    // external response this process must not buffer without bound.
+    let (text, _truncated) = crate::fetch::read_capped_text(resp, 4 * 1024 * 1024).await;
     if !status.is_success() {
         anyhow::bail!("search api http {status}: {}", &text.chars().take(200).collect::<String>());
     }
@@ -147,7 +149,7 @@ async fn ddg_search(client: &reqwest::Client, query: &str) -> anyhow::Result<Vec
     if !status.is_success() {
         anyhow::bail!("ddg http {status}");
     }
-    let html = resp.text().await.unwrap_or_default();
+    let (html, _truncated) = crate::fetch::read_capped_text(resp, 4 * 1024 * 1024).await;
     Ok(parse_ddg_html(&html))
 }
 
@@ -263,7 +265,7 @@ async fn nvd_search(
         .await
         .map_err(|e| anyhow::anyhow!("nvd: {e}"))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let (text, _truncated) = crate::fetch::read_capped_text(resp, 4 * 1024 * 1024).await;
     if !status.is_success() {
         anyhow::bail!(
             "nvd http {status}: {}",

@@ -55,7 +55,13 @@ async fn fetch(
         .to_string();
     let len = match resp.content_length() {
         Some(l) => l as usize,
-        None => resp.bytes().await.map(|b| b.len()).unwrap_or(0),
+        // No Content-Length (chunked transfer, trivial for a hostile target
+        // to force) must not mean "read until the body ends": this runs
+        // once per candidate path - up to ~2.4k times a flow - so an
+        // unbounded read here is the DoS surface multiplied by the whole
+        // wordlist. Only the byte count is needed, so the cap can be
+        // generous without ever keeping the data around.
+        None => crate::fetch::read_capped_body(resp, 1024 * 1024).await.0.len(),
     };
     Some((status, len, ctype, location, url))
 }
