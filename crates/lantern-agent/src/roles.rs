@@ -87,6 +87,8 @@ static ROLES: [Role; 6] = [
             "tls_inspect",
             "waf_fingerprint",
             "secret_scan",
+            "api_schema_scan",
+            "graphql_introspect",
             "web_search",
             "port_scan",
             "memory_search",
