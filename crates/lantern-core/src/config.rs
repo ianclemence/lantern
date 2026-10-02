@@ -220,6 +220,10 @@ fn default_allowlist() -> Vec<String> {
         "testssl.sh",
         "gobuster",
         "amass",
+        "GetUserSPNs.py",
+        "GetNPUsers.py",
+        "crackmapexec",
+        "bloodhound-python",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -236,12 +240,18 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| tools_dir.join("share").join("nuclei-templates"));
         // Host binaries live either on the system PATH or in the tools dir that
-        // `lantern setup` provisions (john is a standalone directory).
-        let default_restricted_path = format!(
+        // `lantern setup` provisions (john is a standalone directory). Pip's
+        // `--user` scripts (impacket, crackmapexec, bloodhound-python) land in
+        // the per-user bin directory, so it joins the search path too.
+        let mut default_restricted_path = format!(
             "/usr/local/bin:/usr/bin:/bin:{}:{}",
             tools_dir.join("john").display(),
             tools_dir.join("bin").display()
         );
+        if let Some(home) = env_str("HOME") {
+            default_restricted_path.push(':');
+            default_restricted_path.push_str(&format!("{home}/.local/bin"));
+        }
 
         // Device-sized defaults: `lantern doctor` used to compute these and
         // then throw the numbers away, leaving every box - a 4-core/8 GiB
@@ -402,7 +412,8 @@ mod tests {
             a,
             vec![
                 "nmap", "sqlmap", "nikto", "hydra", "tcpdump", "nuclei", "msfconsole", "john",
-                "bwrap", "testssl.sh", "gobuster", "amass"
+                "bwrap", "testssl.sh", "gobuster", "amass", "GetUserSPNs.py", "GetNPUsers.py",
+                "crackmapexec", "bloodhound-python"
             ]
         );
         assert!(a.iter().all(|b| !b.contains('/') && !b.contains(' ')));
