@@ -38,7 +38,22 @@ const PACKAGES: &[(&str, &str)] = &[
 const BUILD_PACKAGES: &[&str] = &["build-essential", "libssl-dev", "zlib1g-dev", "git"];
 
 /// Provisioning needs a handful of binaries the agent never runs.
-const PROVISION_TOOLS: &[&str] = &["git", "gcc", "make", "configure", "sudo", "apt-get", "gpg", "dpkg"];
+const PROVISION_TOOLS: &[&str] =
+    &["git", "gcc", "make", "configure", "sudo", "apt-get", "gpg", "dpkg", "pip3"];
+
+/// The AD/Impacket-style binaries `lantern setup` tries to get onto PATH via
+/// `pip3 install --user`, since none of them ship as exact-named distribution
+/// packages (Debian's `python3-impacket` renames the scripts with an
+/// `impacket-` prefix, which would not match what the host-tool adapters
+/// actually invoke).
+const AD_TOOL_BINS: &[&str] =
+    &["GetUserSPNs.py", "GetNPUsers.py", "crackmapexec", "bloodhound-python"];
+const AD_PIP_PACKAGES: &[&str] = &["impacket", "crackmapexec", "bloodhound"];
+
+/// kube-hunter ships only as a pip package (and a container image this
+/// agent never pulls), same reasoning as the AD tooling above.
+const K8S_TOOL_BINS: &[&str] = &["kube-hunter"];
+const K8S_PIP_PACKAGES: &[&str] = &["kube-hunter"];
 
 const JOHN_REPO: &str = "https://github.com/openwall/john.git";
 const TEMPLATES_REPO: &str = "https://github.com/projectdiscovery/nuclei-templates.git";
@@ -243,7 +258,63 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         install_metasploit(&mut ctx, &config, sudo, apt).await?;
     }
 
-    // 8. report --------------------------------------------------------------------
+    // 8. Active Directory tooling (Impacket, crackmapexec, bloodhound-python) --
+    let ad_missing: Vec<&str> =
+        AD_TOOL_BINS.iter().copied().filter(|b| resolve(&config, b).is_err()).collect();
+    if ad_missing.is_empty() {
+        ok("AD tooling (impacket, crackmapexec, bloodhound-python)");
+    } else if config.offline {
+        skipped(&format!("AD tooling: offline mode, not installed ({})", ad_missing.join(", ")));
+    } else if resolve(&config, "pip3").is_err() {
+        warn(&format!(
+            "AD tooling: pip3 unavailable - install manually with pip: {}",
+            AD_PIP_PACKAGES.join(" ")
+        ));
+    } else {
+        installing(&format!("AD tooling (pip3 install --user {})", AD_PIP_PACKAGES.join(" ")));
+        let mut args = vec!["install".to_string(), "--user".to_string(), "--quiet".to_string()];
+        args.extend(AD_PIP_PACKAGES.iter().map(|s| s.to_string()));
+        match run_cmd(&mut ctx, "setup", "pip3", &args, Duration::from_secs(600), None).await {
+            Ok(_) => {
+                let still_missing: Vec<&str> = AD_TOOL_BINS
+                    .iter()
+                    .copied()
+                    .filter(|b| resolve(&config, b).is_err())
+                    .collect();
+                if still_missing.is_empty() {
+                    ok("AD tooling installed");
+                } else {
+                    warn(&format!(
+                        "AD tooling: still missing after pip install: {}",
+                        still_missing.join(", ")
+                    ));
+                }
+            }
+            Err(e) => warn(&format!("AD tooling: pip install failed: {e:#}")),
+        }
+    }
+
+    // 9. kube-hunter -----------------------------------------------------------
+    let k8s_missing: Vec<&str> =
+        K8S_TOOL_BINS.iter().copied().filter(|b| resolve(&config, b).is_err()).collect();
+    if k8s_missing.is_empty() {
+        ok("kube-hunter");
+    } else if config.offline {
+        skipped("kube-hunter: offline mode, not installed");
+    } else if resolve(&config, "pip3").is_err() {
+        warn(&format!("kube-hunter: pip3 unavailable - install manually: pip install {}", K8S_PIP_PACKAGES.join(" ")));
+    } else {
+        installing(&format!("kube-hunter (pip3 install --user {})", K8S_PIP_PACKAGES.join(" ")));
+        let mut args = vec!["install".to_string(), "--user".to_string(), "--quiet".to_string()];
+        args.extend(K8S_PIP_PACKAGES.iter().map(|s| s.to_string()));
+        match run_cmd(&mut ctx, "setup", "pip3", &args, Duration::from_secs(600), None).await {
+            Ok(_) if resolve(&config, "kube-hunter").is_ok() => ok("kube-hunter installed"),
+            Ok(_) => warn("kube-hunter: still missing after pip install"),
+            Err(e) => warn(&format!("kube-hunter: pip install failed: {e:#}")),
+        }
+    }
+
+    // 10. report --------------------------------------------------------------------
     println!("\n  result:");
     let mut missing = Vec::new();
     for bin in &user_allowlist {

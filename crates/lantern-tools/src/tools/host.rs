@@ -90,7 +90,80 @@ pub fn host_tools() -> Vec<HostToolEntry> {
             offensive: true,
             default_args: vec![],
         },
+        HostToolEntry {
+            binary: "GetUserSPNs.py",
+            description: "ACTIVE: Kerberoasting - dumps crackable TGS hashes for in-scope AD \
+                           service accounts (Impacket). Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
+        HostToolEntry {
+            binary: "GetNPUsers.py",
+            description: "ACTIVE: AS-REP Roasting - dumps crackable hashes for in-scope AD \
+                           accounts without Kerberos pre-auth (Impacket). Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
+        HostToolEntry {
+            binary: "crackmapexec",
+            description: "ACTIVE: SMB/WinRM/LDAP enumeration and credential check against an \
+                           in-scope AD host - never runs code on the target. Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
+        HostToolEntry {
+            binary: "bloodhound-python",
+            description: "ACTIVE: collects in-scope AD relationship data for BloodHound. \
+                           Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
+        HostToolEntry {
+            binary: "kube-hunter",
+            description: "ACTIVE: kube-hunter remote active probing of an in-scope Kubernetes \
+                           cluster for known attack vectors. Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
     ]
+}
+
+/// AD domain name: dots/dashes/alphanumerics only, no shell metacharacters.
+fn valid_ad_domain(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+/// AD account name: conservative charset, blocks every character that could
+/// matter to a downstream parser even though there is no shell in this path.
+fn valid_ad_account(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && !s.chars().any(|c| matches!(c, ';' | '|' | '`' | '$' | '\n' | '\r' | '\\' | '"' | '\''))
+}
+
+/// A domain controller target: IP, hostname, or `[v6]`, nothing else.
+fn valid_dc_target(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c))
+}
+
+/// Free-text secret (password): no control characters, bounded length. Still
+/// passed as a single argv element (no shell), so this is defense in depth,
+/// not an injection boundary.
+fn valid_secret(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && !s.chars().any(|c| c.is_control())
+}
+
+/// NTLM hash, `LM:NT` or a bare `NT` hash - 32 hex characters per half.
+fn valid_ntlm_hash_pair(s: &str) -> bool {
+    let is_hex32 = |p: &str| p.len() == 32 && p.chars().all(|c| c.is_ascii_hexdigit());
+    match s.split_once(':') {
+        Some((lm, nt)) => is_hex32(lm) && is_hex32(nt),
+        None => is_hex32(s),
+    }
 }
 
 /// Extract the authority (host) from a URL for scope checking.
@@ -531,6 +604,204 @@ impl HostTool {
                 }
                 Ok(args)
             }
+            "GetUserSPNs.py" => {
+                let domain = super::str_field(input, "domain")?;
+                if !valid_ad_domain(&domain) {
+                    anyhow::bail!("invalid AD domain");
+                }
+                let username = super::str_field(input, "username")?;
+                if !valid_ad_account(&username) {
+                    anyhow::bail!("invalid username");
+                }
+                let dc_ip = super::str_field(input, "dc_ip")?;
+                if !valid_dc_target(&dc_ip) {
+                    anyhow::bail!("invalid dc_ip");
+                }
+                let mut args = Vec::new();
+                match (
+                    super::opt_str_field(input, "password"),
+                    super::opt_str_field(input, "hashes"),
+                ) {
+                    (Some(p), _) => {
+                        if !valid_secret(&p) {
+                            anyhow::bail!("invalid password");
+                        }
+                        args.push(format!("{domain}/{username}:{p}"));
+                    }
+                    (None, Some(h)) => {
+                        if !valid_ntlm_hash_pair(&h) {
+                            anyhow::bail!("invalid `hashes` (expected LM:NT, 32 hex each)");
+                        }
+                        args.push(format!("{domain}/{username}"));
+                        args.push("-hashes".into());
+                        args.push(h);
+                    }
+                    (None, None) => anyhow::bail!("provide `password` or `hashes`"),
+                }
+                args.push("-dc-ip".into());
+                args.push(dc_ip);
+                args.push("-request".into());
+                Ok(args)
+            }
+            "GetNPUsers.py" => {
+                let domain = super::str_field(input, "domain")?;
+                if !valid_ad_domain(&domain) {
+                    anyhow::bail!("invalid AD domain");
+                }
+                let dc_ip = super::str_field(input, "dc_ip")?;
+                if !valid_dc_target(&dc_ip) {
+                    anyhow::bail!("invalid dc_ip");
+                }
+                let mut args = Vec::new();
+                match (
+                    super::opt_str_field(input, "username"),
+                    super::opt_str_field(input, "usersfile"),
+                ) {
+                    (Some(u), _) => {
+                        if !valid_ad_account(&u) {
+                            anyhow::bail!("invalid username");
+                        }
+                        args.push(format!("{domain}/{u}"));
+                    }
+                    (None, Some(list)) => {
+                        let p = std::path::PathBuf::from(&list);
+                        crate::ctx::require_input_file(&p)?;
+                        args.push(format!("{domain}/"));
+                        args.push("-usersfile".into());
+                        args.push(list);
+                    }
+                    (None, None) => anyhow::bail!("provide `username` or `usersfile`"),
+                }
+                args.push("-no-pass".into());
+                args.push("-dc-ip".into());
+                args.push(dc_ip);
+                args.push("-format".into());
+                args.push("hashcat".into());
+                Ok(args)
+            }
+            "crackmapexec" => {
+                let protocol = super::str_field(input, "protocol")?;
+                if !["smb", "winrm", "ldap"].contains(&protocol.as_str()) {
+                    anyhow::bail!("protocol must be smb, winrm, or ldap");
+                }
+                let target = super::str_field(input, "target")?;
+                if !valid_dc_target(&target) && !is_bare_cidr(&target) {
+                    anyhow::bail!("invalid target for crackmapexec");
+                }
+                let mut args = vec![protocol, target];
+                if let Some(u) = super::opt_str_field(input, "username") {
+                    if !valid_ad_account(&u) {
+                        anyhow::bail!("invalid username");
+                    }
+                    args.push("-u".into());
+                    args.push(u);
+                }
+                match (
+                    super::opt_str_field(input, "password"),
+                    super::opt_str_field(input, "hashes"),
+                ) {
+                    (Some(p), _) => {
+                        if !valid_secret(&p) {
+                            anyhow::bail!("invalid password");
+                        }
+                        args.push("-p".into());
+                        args.push(p);
+                    }
+                    (None, Some(h)) => {
+                        if !valid_ntlm_hash_pair(&h) {
+                            anyhow::bail!("invalid `hashes` (expected LM:NT or a bare NT hash)");
+                        }
+                        args.push("-H".into());
+                        args.push(h);
+                    }
+                    (None, None) => {}
+                }
+                if let Some(domain) = super::opt_str_field(input, "domain") {
+                    if !valid_ad_domain(&domain) {
+                        anyhow::bail!("invalid domain");
+                    }
+                    args.push("-d".into());
+                    args.push(domain);
+                }
+                // Enumeration-only: never a code-execution flag (-x/-X/
+                // --exec-method are not in this allowlist and never will be -
+                // Lantern carries no exploit/execution code of its own).
+                const ALLOWED_MODULES: &[&str] = &[
+                    "--shares",
+                    "--users",
+                    "--groups",
+                    "--sessions",
+                    "--pass-pol",
+                    "--loggedon-users",
+                    "--local-groups",
+                    "--disks",
+                ];
+                if let Some(m) = super::opt_str_field(input, "enum_flag") {
+                    if !ALLOWED_MODULES.contains(&m.as_str()) {
+                        anyhow::bail!(
+                            "enum_flag must be one of {ALLOWED_MODULES:?} (no code-execution \
+                             flags are ever accepted)"
+                        );
+                    }
+                    args.push(m);
+                }
+                Ok(args)
+            }
+            "bloodhound-python" => {
+                let domain = super::str_field(input, "domain")?;
+                if !valid_ad_domain(&domain) {
+                    anyhow::bail!("invalid AD domain");
+                }
+                let username = super::str_field(input, "username")?;
+                if !valid_ad_account(&username) {
+                    anyhow::bail!("invalid username");
+                }
+                let password = super::str_field(input, "password")?;
+                if !valid_secret(&password) {
+                    anyhow::bail!("invalid password");
+                }
+                let dc_ip = super::str_field(input, "dc_ip")?;
+                if !valid_dc_target(&dc_ip) {
+                    anyhow::bail!("invalid dc_ip");
+                }
+                let method = super::opt_str_field(input, "collection_method")
+                    .unwrap_or_else(|| "DCOnly".into());
+                const ALLOWED_METHODS: &[&str] = &[
+                    "Default",
+                    "DCOnly",
+                    "All",
+                    "Group",
+                    "LocalAdmin",
+                    "Session",
+                    "Trusts",
+                    "ACL",
+                ];
+                if !ALLOWED_METHODS.contains(&method.as_str()) {
+                    anyhow::bail!("collection_method must be one of {ALLOWED_METHODS:?}");
+                }
+                Ok(vec![
+                    "-d".into(),
+                    domain,
+                    "-u".into(),
+                    username,
+                    "-p".into(),
+                    password,
+                    "-ns".into(),
+                    dc_ip.clone(),
+                    "-dc".into(),
+                    dc_ip,
+                    "-c".into(),
+                    method,
+                    "--zip".into(),
+                ])
+            }
+            "kube-hunter" => {
+                let host = super::str_field(input, "host")?;
+                if !valid_dc_target(&host) && !is_bare_cidr(&host) {
+                    anyhow::bail!("invalid host for kube-hunter");
+                }
+                Ok(vec!["--remote".into(), host, "--report".into(), "json".into()])
+            }
             other => anyhow::bail!("no argument builder for `{other}`"),
         }
     }
@@ -607,6 +878,11 @@ impl HostTool {
             // bound leaves a 2-minute buffer for it to flush output and exit
             // cleanly, the same pattern nikto's -maxtime uses under its adapter.
             "amass" => 1_920,
+            "GetUserSPNs.py" => 120,
+            "GetNPUsers.py" => 120,
+            "crackmapexec" => 180,
+            "bloodhound-python" => 600,
+            "kube-hunter" => 300,
             _ => 120,
         })
     }
@@ -782,6 +1058,41 @@ impl HostTool {
                     format!("amass: {} name(s) resolved", names.len())
                 }
             }
+            "GetUserSPNs.py" => {
+                let hits = lines.iter().filter(|l| l.contains("$krb5tgs$")).count();
+                if hits == 0 {
+                    "GetUserSPNs.py: no roastable service accounts found".into()
+                } else {
+                    format!("GetUserSPNs.py: {hits} roastable service account hash(es)")
+                }
+            }
+            "GetNPUsers.py" => {
+                let hits = lines.iter().filter(|l| l.contains("$krb5asrep$")).count();
+                if hits == 0 {
+                    "GetNPUsers.py: no AS-REP roastable accounts found".into()
+                } else {
+                    format!("GetNPUsers.py: {hits} AS-REP roastable account hash(es)")
+                }
+            }
+            "crackmapexec" => {
+                let hits = lines.iter().filter(|l| l.contains("[+]")).count();
+                format!("crackmapexec: {hits} successful check(s) (exit {:?})", out.exit_code)
+            }
+            "bloodhound-python" => {
+                if text.contains(".zip") || text.to_ascii_lowercase().contains("done") {
+                    "bloodhound-python: collection finished".into()
+                } else {
+                    format!("bloodhound-python: exit {:?}", out.exit_code)
+                }
+            }
+            "kube-hunter" => {
+                let hits = text.matches("\"vulnerability\"").count();
+                if hits == 0 {
+                    "kube-hunter: finished, no vulnerabilities reported".into()
+                } else {
+                    format!("kube-hunter: {hits} vulnerabilit(y/ies) reported")
+                }
+            }
             _ => {
                 let first = lines.first().unwrap_or(&"").to_string();
                 format!("{}: exit {:?} {}", self.entry.binary, out.exit_code, first)
@@ -944,6 +1255,11 @@ impl Tool for HostTool {
             "testssl.sh" => "host_testssl",
             "gobuster" => "host_gobuster",
             "amass" => "host_amass",
+            "GetUserSPNs.py" => "host_getuserspns",
+            "GetNPUsers.py" => "host_getnpusers",
+            "crackmapexec" => "host_crackmapexec",
+            "bloodhound-python" => "host_bloodhound",
+            "kube-hunter" => "host_kubehunter",
             _ => "host_unknown",
         }
     }
@@ -1064,6 +1380,58 @@ impl Tool for HostTool {
                 },
                 "required": ["host"]
             }),
+            "GetUserSPNs.py" => json!({
+                "type": "object",
+                "properties": {
+                    "domain": {"type": "string"},
+                    "username": {"type": "string"},
+                    "password": {"type": "string", "description": "or `hashes`"},
+                    "hashes": {"type": "string", "description": "NTLM LM:NT"},
+                    "dc_ip": {"type": "string", "description": "in-scope DC"}
+                },
+                "required": ["domain", "username", "dc_ip"]
+            }),
+            "GetNPUsers.py" => json!({
+                "type": "object",
+                "properties": {
+                    "domain": {"type": "string"},
+                    "username": {"type": "string"},
+                    "usersfile": {"type": "string", "description": "one user per line"},
+                    "dc_ip": {"type": "string", "description": "in-scope DC"}
+                },
+                "required": ["domain", "dc_ip"]
+            }),
+            "crackmapexec" => json!({
+                "type": "object",
+                "properties": {
+                    "protocol": {"type": "string", "description": "smb|winrm|ldap"},
+                    "target": {"type": "string", "description": "in-scope host/IP/CIDR"},
+                    "username": {"type": "string"},
+                    "password": {"type": "string"},
+                    "hashes": {"type": "string", "description": "NTLM LM:NT or NT"},
+                    "domain": {"type": "string"},
+                    "enum_flag": {"type": "string", "description": "read-only only: --shares --users --groups --sessions --pass-pol --loggedon-users --local-groups --disks"}
+                },
+                "required": ["protocol", "target"]
+            }),
+            "bloodhound-python" => json!({
+                "type": "object",
+                "properties": {
+                    "domain": {"type": "string"},
+                    "username": {"type": "string"},
+                    "password": {"type": "string"},
+                    "dc_ip": {"type": "string", "description": "in-scope DC"},
+                    "collection_method": {"type": "string", "description": "DCOnly|All|Group|Session|Trusts|ACL"}
+                },
+                "required": ["domain", "username", "password", "dc_ip"]
+            }),
+            "kube-hunter" => json!({
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "in-scope Kubernetes API/node host, IP, or CIDR"}
+                },
+                "required": ["host"]
+            }),
             _ => json!({"type": "object", "properties": {}}),
         }
     }
@@ -1084,7 +1452,7 @@ impl Tool for HostTool {
             }
 
             // Scope check on whatever authority the input describes.
-            let target = ["host", "url"]
+            let target = ["host", "url", "dc_ip", "target"]
                 .iter()
                 .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
                 .unwrap_or_default();
@@ -1244,13 +1612,146 @@ mod tests {
 
     #[test]
     fn active_tools_are_gated() {
-        for b in ["sqlmap", "hydra", "nuclei", "msfconsole", "john", "amass"] {
+        for b in [
+            "sqlmap",
+            "hydra",
+            "nuclei",
+            "msfconsole",
+            "john",
+            "amass",
+            "GetUserSPNs.py",
+            "GetNPUsers.py",
+            "crackmapexec",
+            "bloodhound-python",
+            "kube-hunter",
+        ] {
             assert!(entry(b).offensive, "{b} must require --offensive");
         }
         for b in ["nmap", "nikto", "tcpdump", "testssl.sh", "gobuster"] {
             assert!(!entry(b).offensive, "{b} must stay non-offensive");
         }
         assert_eq!(entry("nuclei").binary, "nuclei");
+    }
+
+    #[test]
+    fn getuserspns_builds_a_single_domain_user_pass_argument() {
+        let ctx = super::super::test_ctx();
+        let t = HostTool { entry: entry("GetUserSPNs.py") };
+        let args = t
+            .build_args(
+                &json!({"domain": "corp.local", "username": "svc", "password": "s3cr3t", "dc_ip": "10.0.0.5"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(args[0], "corp.local/svc:s3cr3t");
+        assert!(args.windows(2).any(|w| w == ["-dc-ip", "10.0.0.5"]));
+        assert!(args.contains(&"-request".to_string()));
+
+        let args = t
+            .build_args(
+                &json!({"domain": "corp.local", "username": "svc",
+                        "hashes": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+                        "dc_ip": "10.0.0.5"}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(args.contains(&"-hashes".to_string()));
+
+        assert!(t
+            .build_args(&json!({"domain": "corp.local; rm -rf /", "username": "svc",
+                                "password": "x", "dc_ip": "10.0.0.5"}), &ctx)
+            .is_err());
+        assert!(t
+            .build_args(&json!({"domain": "corp.local", "username": "svc", "dc_ip": "10.0.0.5"}), &ctx)
+            .is_err(), "needs password or hashes");
+    }
+
+    #[test]
+    fn getnpusers_supports_single_user_or_a_usersfile() {
+        let ctx = super::super::test_ctx();
+        let t = HostTool { entry: entry("GetNPUsers.py") };
+        let args = t
+            .build_args(&json!({"domain": "corp.local", "username": "jdoe", "dc_ip": "10.0.0.5"}), &ctx)
+            .unwrap();
+        assert_eq!(args[0], "corp.local/jdoe");
+        assert!(args.contains(&"-no-pass".to_string()));
+
+        let args = t
+            .build_args(
+                &json!({"domain": "corp.local", "usersfile": "/etc/hostname", "dc_ip": "10.0.0.5"}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(args.contains(&"-usersfile".to_string()));
+
+        assert!(t
+            .build_args(&json!({"domain": "corp.local", "dc_ip": "10.0.0.5"}), &ctx)
+            .is_err(), "needs username or usersfile");
+        assert!(t
+            .build_args(
+                &json!({"domain": "corp.local", "usersfile": "/nonexistent-file", "dc_ip": "10.0.0.5"}),
+                &ctx
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn crackmapexec_never_accepts_a_code_execution_flag() {
+        let ctx = super::super::test_ctx();
+        let t = HostTool { entry: entry("crackmapexec") };
+        let args = t
+            .build_args(
+                &json!({"protocol": "smb", "target": "10.0.0.5", "username": "u", "password": "p",
+                        "enum_flag": "--shares"}),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(args[0], "smb");
+        assert!(args.contains(&"--shares".to_string()));
+
+        for bad in ["-x", "-X", "--exec-method", "whoami"] {
+            assert!(
+                t.build_args(
+                    &json!({"protocol": "smb", "target": "10.0.0.5", "enum_flag": bad}),
+                    &ctx
+                )
+                .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert!(t.build_args(&json!({"protocol": "ftp", "target": "10.0.0.5"}), &ctx).is_err());
+    }
+
+    #[test]
+    fn bloodhound_python_requires_credentials_and_validates_collection_method() {
+        let ctx = super::super::test_ctx();
+        let t = HostTool { entry: entry("bloodhound-python") };
+        let args = t
+            .build_args(
+                &json!({"domain": "corp.local", "username": "u", "password": "p", "dc_ip": "10.0.0.5"}),
+                &ctx,
+            )
+            .unwrap();
+        assert!(args.contains(&"--zip".to_string()));
+        assert!(args.contains(&"DCOnly".to_string()));
+
+        assert!(t
+            .build_args(
+                &json!({"domain": "corp.local", "username": "u", "password": "p", "dc_ip": "10.0.0.5",
+                        "collection_method": "Everything"}),
+                &ctx
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn ntlm_hash_validation() {
+        assert!(valid_ntlm_hash_pair(
+            "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"
+        ));
+        assert!(valid_ntlm_hash_pair("31d6cfe0d16ae931b73c59d7e0c089c0"));
+        assert!(!valid_ntlm_hash_pair("not-a-hash"));
+        assert!(!valid_ntlm_hash_pair("31d6cfe0d16ae931b73c59d7e0c089c0:short"));
     }
 
     #[test]

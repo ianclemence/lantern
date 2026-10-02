@@ -61,7 +61,7 @@ bigger box, no rebuild required. An explicit `LANTERN_CONCURRENCY` or
 ## Quick start
 
 ```sh
-make && make test                 # release build; 275+ tests, no API spend
+make && make test                 # release build; 360+ tests, no API spend
 ./target/release/lantern setup    # provider, model, key, then every host tool
 lantern doctor                    # confirm what's configured
 
@@ -94,6 +94,10 @@ lantern report <flow-id> [--out report.md]        # markdown, from the database,
 lantern delete <flow-id> --yes                     # permanently remove one flow, every row and file
 lantern tools                                     # every tool and its gate
 lantern gc                                        # retention: compress, prune, vacuum
+lantern queue add --target T --scope S [--offensive] [--dry-run]  # schedule, don't run yet
+lantern queue list [--status pending|running|done|failed]
+lantern queue remove <id>                         # a running job must finish first
+lantern daemon [--interval SECS]                  # poll the queue, run jobs unattended
 ```
 
 ## Architecture
@@ -166,9 +170,9 @@ rather than "whatever the model decides to reach for."
 |---|---|---|
 | orchestrator | turns the objective into a short written plan | - |
 | planner | reorders the plan by risk and effort | - |
-| researcher | passive recon: DNS, TLS, headers, WHOIS, ports, subdomains, WAF/CDN, leaked secrets, web search | `dns_lookup`, `subdomain_enum`, `tls_inspect`, `http_probe`, `waf_fingerprint`, `secret_scan`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `delegate_task` |
+| researcher | passive recon: DNS, TLS, headers, WHOIS, ports, subdomains, WAF/CDN, leaked secrets, API schemas, cloud/container exposure, web search | `dns_lookup`, `subdomain_enum`, `tls_inspect`, `http_probe`, `waf_fingerprint`, `secret_scan`, `api_schema_scan`, `graphql_introspect`, `cloud_bucket_check`, `container_expose_check`, `whois`, `port_scan`, `web_search`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `delegate_task` |
 | coder | reproducible check steps and remediation advice | `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `code_run`, `secret_scan`, `delegate_task` |
-| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_testssl`, `host_gobuster`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `host_amass`\*, `waf_fingerprint`, `secret_scan`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `delegate_task` |
+| pentester | active verification inside scope | `port_scan`, `dir_bruteforce`, `host_nmap`, `host_nikto`, `host_tcpdump`, `host_testssl`, `host_gobuster`, `host_sqlmap`\*, `host_hydra`\*, `host_nuclei`\*, `host_msfconsole`\*, `host_john`\*, `host_amass`\*, `host_getuserspns`\*, `host_getnpusers`\*, `host_crackmapexec`\*, `host_bloodhound`\*, `host_kubehunter`\*, `cloud_bucket_check`, `container_expose_check`, `waf_fingerprint`, `secret_scan`, `memory_search`, `memory_store`, `ask_operator`, `plan_patch`, `delegate_task` |
 | reflector | judges evidence quality and confidence of every finding | `memory_search`, `ask_operator`, `plan_patch` |
 
 \* requires `--offensive`.
@@ -289,6 +293,16 @@ A few things worth knowing about what that does and doesn't guarantee:
 - **No single-instance lock exists or is needed.** There is nothing to
   coordinate: each flow is independent, scope-checked and budgeted on its
   own, and the database is the only shared state.
+
+For unattended/scheduled assessment, `lantern queue add` plus `lantern
+daemon` is the same story at the level of whole flows instead of one
+process: `lantern queue add` from any invocation and a long-running
+`lantern daemon` elsewhere coordinate through nothing but that same shared
+SQLite file (`Db::claim_next_queued` is a locked SELECT immediately
+followed by an UPDATE, so two daemons against the same data root can never
+claim the same job twice). The daemon is a polling loop, not a server: it
+opens no listening socket, and SIGINT/SIGTERM both let the job in progress
+finish before it exits.
 
 ### Session lifecycle: create, read, update, delete
 
@@ -496,28 +510,34 @@ flow after it.
 
 ## Roadmap
 
-What a large-firm engagement often needs that this build doesn't have yet,
-honestly, in the order I'd build it:
+The five gaps this section used to describe are now built:
 
-- **P0 - internal/Active Directory tooling.** `host_msfconsole` already
-  carries real SMB/Kerberos/LDAP modules, but there is no BloodHound-style
-  relationship graph, no standalone Kerberoasting/AS-REP-roasting harness,
-  no Impacket-equivalent toolchain. The biggest real gap for internal
-  engagements.
-- **P1 - API-aware testing.** No OpenAPI/GraphQL schema parser, no
-  JWT-specific analysis, no structured OAuth/SAML flow tester. `EngagementProfile::Api`
-  already tells the model to say so rather than claim coverage it doesn't have.
-- **P2 - cloud posture.** No cloud-provider API client, no IAM policy
-  evaluator, no bucket enumerator beyond what's visible from the outside.
-- **P2 - container/K8s.** No `kube-hunter`-class checks, no container-escape
-  testing.
-- **A real daemon mode**, if scheduled/continuous assessment matters more
-  than a systemd timer wrapping the CLI (see
-  [Concurrency and multiple sessions](#concurrency-and-multiple-sessions)).
+- **Internal/Active Directory tooling**: `host_getuserspns` (Kerberoasting),
+  `host_getnpusers` (AS-REP Roasting), `host_crackmapexec` (SMB/WinRM/LDAP
+  enumeration and credential validation - enumeration only, no execution
+  method is ever accepted), and `host_bloodhound` (BloodHound relationship
+  collection). All `--offensive`-gated, all provisioned by `lantern setup`.
+- **API-aware testing**: `api_schema_scan` parses an OpenAPI/Swagger JSON
+  document and reports which endpoints declare no authentication;
+  `graphql_introspect` reports whether GraphQL introspection is enabled and,
+  if so, the real type/query/mutation surface. Both passive.
+- **Cloud posture**: `cloud_bucket_check`, a credential-free outside-in
+  check of whether an S3 bucket, Azure Blob container, or GCS bucket allows
+  anonymous listing.
+- **Container/K8s**: `container_expose_check` (unauthenticated Docker daemon
+  API or Kubelet anonymous auth, passive) and `host_kubehunter`
+  (kube-hunter active probing, `--offensive`-gated).
+- **A real daemon mode**: `lantern queue add/list/remove` plus
+  `lantern daemon`, a polling loop against Lantern's own SQLite queue table
+  (never a listening socket) that runs jobs through the exact same path
+  `lantern run` already uses. See
+  [Concurrency and multiple sessions](#concurrency-and-multiple-sessions).
 
-None of these are silently missing: `prompts::engagement_addendum` tells the
-model what it cannot check for a detected profile, specifically so it says
-"no tool for that" instead of narrating a check it never ran.
+What's still honestly missing: JWT-specific analysis, a structured
+OAuth/SAML flow tester, an IAM policy evaluator, and container-escape
+testing. `prompts::engagement_addendum` tells the model what it cannot check
+for a detected profile, specifically so it says "no tool for that" instead
+of narrating a check it never ran.
 
 ## License
 

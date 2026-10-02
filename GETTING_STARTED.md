@@ -31,7 +31,7 @@ sudo apt install build-essential libssl-dev pkg-config
 git clone https://github.com/ianclemence/lantern.git
 cd lantern
 make          # release build, then on-disk and runtime footprint
-make test     # 275+ tests, no API spend (scripted provider)
+make test     # 360+ tests, no API spend (scripted provider)
 ```
 
 If `cargo` is not on `PATH` yet, prefix with `export PATH="$HOME/.cargo/bin:$PATH"`
@@ -123,7 +123,7 @@ lantern doctor
   disk      : 6.55 GB free of 30.79 GB (floor keeps 6.16 GB free)
   generation: deepseek / deepseek-flash @ https://api.deepseek.com [NO KEY - run `lantern setup`]
   embeddings: ollama nomic-embed-text @ http://127.0.0.1:11434 - 768-dim
-  tools     : 15 native, allowlist: nmap sqlmap nikto hydra tcpdump nuclei msfconsole john bwrap testssl.sh gobuster amass
+  tools     : 21 native, allowlist: nmap sqlmap nikto hydra tcpdump nuclei msfconsole john bwrap testssl.sh gobuster amass GetUserSPNs.py GetNPUsers.py crackmapexec bloodhound-python kube-hunter
   runtime   : concurrency 3 | task timeout 120s | child 512 MB / 60 CPU-s | token budget 6000
   warnings  :
     - no generation key: runs are limited to --dry-run

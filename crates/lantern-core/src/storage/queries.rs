@@ -731,6 +731,142 @@ impl Db {
             Ok(s)
         })
     }
+
+    // --------------------------------------------------------------- queue
+
+    fn queue_from_row(r: &Row<'_>) -> rusqlite::Result<QueueJob> {
+        Ok(QueueJob {
+            id: r.get(0)?,
+            target: r.get(1)?,
+            scope: r.get(2)?,
+            roles: r.get(3)?,
+            offensive: r.get::<_, i64>(4)? != 0,
+            dry_run: r.get::<_, i64>(5)? != 0,
+            steps: r.get(6)?,
+            status: r.get(7)?,
+            flow_id: r.get(8)?,
+            error: r.get(9)?,
+            created_at: r.get(10)?,
+            started_at: r.get(11)?,
+            finished_at: r.get(12)?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue(
+        &self,
+        target: &str,
+        scope: &str,
+        roles: Option<&str>,
+        offensive: bool,
+        dry_run: bool,
+        steps: Option<i64>,
+    ) -> Result<QueueJob> {
+        let now = timeutil::now();
+        let id = self.with(|c| {
+            c.execute(
+                "INSERT INTO queue (target, scope, roles, offensive, dry_run, steps, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                params![target, scope, roles, offensive as i64, dry_run as i64, steps, now],
+            )?;
+            Ok(c.last_insert_rowid())
+        })?;
+        self.get_queue_job(id)?
+            .ok_or_else(|| crate::CoreError::Other("queued job disappeared".into()))
+    }
+
+    pub fn get_queue_job(&self, id: i64) -> Result<Option<QueueJob>> {
+        self.one(
+            "SELECT id, target, scope, roles, offensive, dry_run, steps, status, flow_id,
+                    error, created_at, started_at, finished_at
+             FROM queue WHERE id = ?1",
+            params![id],
+            Self::queue_from_row,
+        )
+    }
+
+    /// All queue jobs, newest first; `status` optionally narrows to one
+    /// state (`pending`, `running`, `done`, `failed`).
+    pub fn list_queue(&self, status: Option<&str>) -> Result<Vec<QueueJob>> {
+        self.with(|c| {
+            let mut st = match status {
+                Some(_) => c.prepare(
+                    "SELECT id, target, scope, roles, offensive, dry_run, steps, status, flow_id,
+                            error, created_at, started_at, finished_at
+                     FROM queue WHERE status = ?1 ORDER BY created_at DESC",
+                )?,
+                None => c.prepare(
+                    "SELECT id, target, scope, roles, offensive, dry_run, steps, status, flow_id,
+                            error, created_at, started_at, finished_at
+                     FROM queue ORDER BY created_at DESC",
+                )?,
+            };
+            let rows = match status {
+                Some(s) => st.query_map(params![s], Self::queue_from_row)?,
+                None => st.query_map([], Self::queue_from_row)?,
+            };
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// Atomically claim the oldest pending job (`UPDATE ... RETURNING` would
+    /// be simpler, but the minimum SQLite bundled by `rusqlite` here predates
+    /// it - a `SELECT` immediately followed by an `UPDATE` inside the same
+    /// locked connection is equivalent: no second daemon process can also be
+    /// holding this connection, since `Db` is one connection behind a mutex).
+    pub fn claim_next_queued(&self) -> Result<Option<QueueJob>> {
+        self.with(|c| {
+            let id: Option<i64> = c
+                .query_row(
+                    "SELECT id FROM queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(id) = id else { return Ok(None) };
+            c.execute(
+                "UPDATE queue SET status = 'running', started_at = ?2 WHERE id = ?1",
+                params![id, timeutil::now()],
+            )?;
+            let mut st = c.prepare(
+                "SELECT id, target, scope, roles, offensive, dry_run, steps, status, flow_id,
+                        error, created_at, started_at, finished_at
+                 FROM queue WHERE id = ?1",
+            )?;
+            Ok(Some(st.query_row(params![id], Self::queue_from_row)?))
+        })
+    }
+
+    pub fn finish_queue_job(&self, id: i64, flow_id: Option<&str>, error: Option<&str>) -> Result<()> {
+        let status = if error.is_some() { "failed" } else { "done" };
+        self.with(|c| {
+            c.execute(
+                "UPDATE queue SET status = ?1, flow_id = ?2, error = ?3, finished_at = ?4 WHERE id = ?5",
+                params![status, flow_id, error, timeutil::now(), id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a queued job. Refuses a job that is currently `running` -
+    /// that one belongs to whichever daemon claimed it, not to this call.
+    pub fn remove_queue_job(&self, id: i64) -> Result<bool> {
+        self.with(|c| {
+            let status: Option<String> = c
+                .query_row("SELECT status FROM queue WHERE id=?1", params![id], |r| r.get(0))
+                .optional()?;
+            match status.as_deref() {
+                None => Ok(false),
+                Some("running") => {
+                    Err(crate::CoreError::Other(format!("job {id} is currently running")))
+                }
+                Some(_) => {
+                    c.execute("DELETE FROM queue WHERE id=?1", params![id])?;
+                    Ok(true)
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -972,5 +1108,77 @@ mod tests {
         assert!(db.get_flow("flw_keep").unwrap().is_some());
         assert_eq!(db.events_for_flow("flw_keep").unwrap().len(), 1);
         assert!(db.get_flow("flw_gone").unwrap().is_none());
+    }
+
+    #[test]
+    fn queue_jobs_are_claimed_oldest_first_and_exactly_once() {
+        let db = db("queue-order");
+        let a = db.enqueue("a.example.com", "a.example.com", None, false, false, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = db.enqueue("b.example.com", "b.example.com", Some("researcher"), true, false, Some(4))
+            .unwrap();
+        assert_eq!(a.status, "pending");
+        assert_eq!(b.roles.as_deref(), Some("researcher"));
+        assert!(b.offensive);
+        assert_eq!(b.steps, Some(4));
+
+        let claimed = db.claim_next_queued().unwrap().expect("a job");
+        assert_eq!(claimed.id, a.id, "oldest first");
+        assert_eq!(claimed.status, "running");
+        assert!(claimed.started_at.is_some());
+
+        // The same job is never handed out twice while it is running.
+        let next = db.claim_next_queued().unwrap().expect("b job");
+        assert_eq!(next.id, b.id);
+        assert!(db.claim_next_queued().unwrap().is_none(), "nothing left pending");
+    }
+
+    #[test]
+    fn finishing_a_job_records_success_or_failure() {
+        let db = db("queue-finish");
+        let job = db.enqueue("x.example.com", "x.example.com", None, false, false, None).unwrap();
+        db.claim_next_queued().unwrap();
+        db.finish_queue_job(job.id, Some("flw_abc"), None).unwrap();
+        let done = db.get_queue_job(job.id).unwrap().unwrap();
+        assert_eq!(done.status, "done");
+        assert_eq!(done.flow_id.as_deref(), Some("flw_abc"));
+        assert!(done.error.is_none());
+        assert!(done.finished_at.is_some());
+
+        let job2 = db.enqueue("y.example.com", "y.example.com", None, false, false, None).unwrap();
+        db.claim_next_queued().unwrap();
+        db.finish_queue_job(job2.id, None, Some("boom")).unwrap();
+        let failed = db.get_queue_job(job2.id).unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn removing_a_running_job_is_refused() {
+        let db = db("queue-remove");
+        let job = db.enqueue("z.example.com", "z.example.com", None, false, false, None).unwrap();
+        assert!(db.remove_queue_job(job.id).unwrap(), "pending job removes cleanly");
+        assert!(db.get_queue_job(job.id).unwrap().is_none());
+
+        let job2 = db.enqueue("w.example.com", "w.example.com", None, false, false, None).unwrap();
+        db.claim_next_queued().unwrap();
+        let err = db.remove_queue_job(job2.id).unwrap_err();
+        assert!(err.to_string().contains("running"), "{err}");
+        assert!(db.get_queue_job(job2.id).unwrap().is_some(), "still there");
+
+        assert!(!db.remove_queue_job(999_999).unwrap(), "missing id is a clean false");
+    }
+
+    #[test]
+    fn list_queue_filters_by_status() {
+        let db = db("queue-list");
+        let a = db.enqueue("a.example.com", "a.example.com", None, false, false, None).unwrap();
+        let _b = db.enqueue("b.example.com", "b.example.com", None, false, false, None).unwrap();
+        db.claim_next_queued().unwrap();
+        db.finish_queue_job(a.id, Some("flw_a"), None).unwrap();
+
+        assert_eq!(db.list_queue(None).unwrap().len(), 2);
+        assert_eq!(db.list_queue(Some("done")).unwrap().len(), 1);
+        assert_eq!(db.list_queue(Some("pending")).unwrap().len(), 1);
     }
 }

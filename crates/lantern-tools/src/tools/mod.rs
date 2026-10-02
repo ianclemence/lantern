@@ -2,9 +2,13 @@
 //! executed in-process (no shell, no child process) unless it explicitly wraps
 //! an allowlisted host binary.
 
+pub mod api_schema;
+pub mod cloud_posture;
+pub mod container_expose;
 pub mod dirb;
 pub mod delegate;
 pub mod dns;
+pub mod graphql_introspect;
 pub mod secret_scan;
 pub mod subdomains;
 pub mod waf_fingerprint;

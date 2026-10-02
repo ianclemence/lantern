@@ -130,3 +130,22 @@ pub struct EventRow {
     pub kind: String,
     pub message: String,
 }
+
+/// One `lantern daemon` work-queue entry: the same shape `lantern run`'s own
+/// arguments take, scheduled to run unattended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueJob {
+    pub id: i64,
+    pub target: String,
+    pub scope: String,
+    pub roles: Option<String>,
+    pub offensive: bool,
+    pub dry_run: bool,
+    pub steps: Option<i64>,
+    pub status: String,
+    pub flow_id: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}

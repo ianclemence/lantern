@@ -2,6 +2,7 @@
 
 mod ask;
 mod chat;
+mod daemon;
 mod doctor;
 mod misc;
 mod prefs;
@@ -23,7 +24,9 @@ use std::path::PathBuf;
     long_about = "Lantern runs a scoped, fully audited security assessment from the \
 command line. Tools run in-process or as allowlisted host binaries with a cleared \
 environment, restricted PATH, rlimits, timeouts, output caps and per-flow working \
-directories. There is no shell, no background service and no web UI.\n\n\
+directories. There is no shell and no web UI. `lantern daemon` is the one optional \
+background process: it polls its own SQLite queue file and runs jobs through the same \
+path `lantern run` uses - it opens no listening socket of its own.\n\n\
 SAFETY: only assess systems you are authorised to test. Targets outside --scope are \
 refused. Active testing (sqlmap, hydra, nuclei, msfconsole, john) additionally \
 requires --offensive, and every invocation is written to SQLite and to a trace file."
@@ -147,6 +150,45 @@ enum Cmd {
     Tools,
     /// Enforce retention: compress old artifacts, prune, vacuum
     Gc,
+    /// Manage the unattended work queue `lantern daemon` runs
+    Queue {
+        #[command(subcommand)]
+        action: QueueCmd,
+    },
+    /// Poll the queue and run jobs unattended (SIGINT/SIGTERM stop cleanly
+    /// after the current job finishes)
+    Daemon {
+        /// Seconds between polls when the queue is empty
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueCmd {
+    /// Schedule a flow to run the next time `lantern daemon` polls
+    Add {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        roles: Option<String>,
+        #[arg(long)]
+        offensive: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        steps: Option<usize>,
+    },
+    /// List queued jobs
+    List {
+        /// Filter to one status: pending, running, done, failed
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Remove a pending or finished job (a running one must finish first)
+    Remove { id: i64 },
 }
 
 #[tokio::main]
@@ -264,6 +306,14 @@ async fn real_main() -> anyhow::Result<()> {
                 Cmd::Report { flow_id, out } => misc::report(&config, &flow_id, out)?,
                 Cmd::Delete { flow_id, yes } => println!("{}", misc::delete_flow(&config, &flow_id, yes)?),
                 Cmd::Tools => misc::tools(&config)?,
+                Cmd::Queue { action } => match action {
+                    QueueCmd::Add { target, scope, roles, offensive, dry_run, steps } => {
+                        daemon::queue_add(&config, target, scope, roles, offensive, dry_run, steps)?
+                    }
+                    QueueCmd::List { status } => daemon::queue_list(&config, status)?,
+                    QueueCmd::Remove { id } => daemon::queue_remove(&config, id)?,
+                },
+                Cmd::Daemon { interval } => daemon::run_daemon(config, interval).await?,
                 Cmd::Doctor | Cmd::Gc => unreachable!("handled above"),
             }
         }

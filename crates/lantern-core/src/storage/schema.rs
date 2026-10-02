@@ -6,7 +6,7 @@
 //! - Embeddings live as little-endian f32 BLOBs; similarity is computed in Rust.
 //! - FTS5 gives keyword search; it degrades to `LIKE` if unavailable.
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -131,6 +131,28 @@ CREATE TABLE IF NOT EXISTS knowledge (
     ts  INTEGER NOT NULL,
     PRIMARY KEY (src, dst, rel)
 );
+
+-- `lantern daemon`'s work queue: one row per flow the operator scheduled to
+-- run unattended. The daemon polls for 'pending' rows, claims one at a time
+-- (never concurrently - the same single-connection-behind-a-mutex reasoning
+-- as the rest of this database), and runs it through the exact same
+-- `run_flow` path `lantern run` uses.
+CREATE TABLE IF NOT EXISTS queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target      TEXT NOT NULL,
+    scope       TEXT NOT NULL,
+    roles       TEXT,
+    offensive   INTEGER NOT NULL DEFAULT 0,
+    dry_run     INTEGER NOT NULL DEFAULT 0,
+    steps       INTEGER,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    flow_id     TEXT,
+    error       TEXT,
+    created_at  INTEGER NOT NULL,
+    started_at  INTEGER,
+    finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status, created_at);
 "#;
 
 pub const PRAGMAS: &[(&str, &str)] = &[
