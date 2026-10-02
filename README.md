@@ -14,16 +14,16 @@ learns in SQLite, and writes a deterministic markdown report.
 >
 > **Only assess systems you are authorised to test.** Everything Lantern does
 > is bounded by the `--scope` you declare; targets outside it are refused
-> before any socket opens, and that refusal reads a target's own DNS-resolved
-> address, not just the name you typed (see [Scope](#scope-hostnames-cidr-and-dns-drift)).
+> before any socket opens (see [Scope](#scope-hostnames-cidr-and-dns-drift)).
 >
 > **There is no shell.** Tools take structured arguments and run via `execve`
 > argument arrays only - never `sh -c`, never string-built commands.
 >
 > **Active testing is opt-in twice.** `sqlmap`, `hydra`, `nuclei`, `amass`,
-> `msfconsole` and `john` refuse to run unless the flow was started with
-> `--offensive` *and* the target is in scope. A natural-language instruction
-> (`lantern ask`/`chat`) can narrow that gate, never grant it.
+> `msfconsole`, `john` and the AD/`kube-hunter` tools refuse to run unless the
+> flow was started with `--offensive` *and* the target is in scope. A
+> natural-language instruction (`lantern ask`/`chat`) can narrow that gate,
+> never grant it.
 >
 > **Everything is audited.** Binary, full argv, cwd, exit code, duration,
 > output size, resolved IP - every invocation lands in SQLite and a JSONL
@@ -34,28 +34,23 @@ learns in SQLite, and writes a deterministic markdown report.
 ## What this is, and isn't
 
 A CLI, not a service: one process per invocation, one SQLite database as the
-single source of truth, no listener, no web UI. Isolation on the host side
-comes from an executable allowlist, a cleared environment, a restricted
-`PATH`, `setrlimit` (CPU/AS/FSIZE/NOFILE/NPROC/CORE), wall-clock timeouts,
-output caps and a per-flow working directory - not a VM or container
-runtime. Lantern carries no exploit code or payload generator of its own:
-anything intrusive is a host tool, allowlisted, gated behind `--offensive`,
-matched against `--scope`, and recorded argv-for-argv.
+single source of truth, no listener, no web UI. The one optional background
+process, `lantern daemon`, is a polling loop against that same SQLite file -
+it opens no socket of its own (see [Concurrency, sessions, and the
+daemon](#concurrency-sessions-and-the-daemon)).
 
-It was built for, and is sized against, one reference machine class:
+Isolation on the host side comes from an executable allowlist, a cleared
+environment, a restricted `PATH`, `setrlimit` (CPU/AS/FSIZE/NOFILE/NPROC/CORE),
+wall-clock timeouts, output caps and a per-flow working directory - not a VM
+or container runtime. Lantern carries no exploit code or payload generator of
+its own: anything intrusive is a host tool, allowlisted, gated behind
+`--offensive`, matched against `--scope`, and recorded argv-for-argv.
 
-| | |
-|---|---|
-| CPU / RAM | 4 × Cortex-A76 @ 2.4 GHz aarch64, 7.87 GiB + 2 GiB zram swap |
-| Disk | 30.79 GB ext4, 20% kept free as a floor `lantern setup` won't cross |
-| OS | Debian 13 (trixie), kernel 6.18, glibc 2.41 |
-| GPU | none (display-only) - inference is always external |
-
-That table is a reference point, not a hardcoded assumption: `lantern
-doctor` re-measures whatever device it's actually on, and concurrency /
-child-memory rlimits scale with it (`DeviceProfile::detect` reads live
-cores/RAM/swap) - down toward 1 task/256 MB on something smaller, up on a
-bigger box, no rebuild required. An explicit `LANTERN_CONCURRENCY` or
+It was built for, and is sized against, one reference machine class - 4-core
+aarch64, ~8 GiB RAM, 30 GB disk - but `lantern doctor` re-measures whatever
+device it's actually on and scales concurrency/child-memory rlimits to match
+(`DeviceProfile::detect`), down toward 1 task/256 MB on something smaller, up
+on a bigger box, no rebuild required. An explicit `LANTERN_CONCURRENCY` or
 `LANTERN_CHILD_MEM_MB` still wins over the derived value.
 
 ## Quick start
@@ -75,6 +70,56 @@ lantern chat                      # the same flow, conversational
 Requires Rust 1.85+ and OpenSSL development headers (`libssl-dev` on
 Debian/Ubuntu); TLS uses the system OpenSSL (`native-tls`) to keep the build
 free of `cmake`/`ring`/a bundled `libclang`.
+
+## Setup
+
+`lantern setup` is the whole installation story: on a fresh machine it asks
+the three questions only you can answer and provisions what's missing; on an
+already-configured machine it reports everything present and changes
+nothing. Re-running it is free. **Installing packages is something `setup`
+does - never `run`, `ask`, or `chat`**, which only check what's already
+resolvable on the restricted `PATH`.
+
+**The model half** comes first (it's one API call; the tools can take
+minutes). It lists providers (see [Providers](#providers)), fetches the
+endpoint's own live model list, reads the key with input hidden, and spends
+one real completion verifying it works before storing it. With no terminal
+attached (a script, CI), it takes whatever the environment already provides,
+checks it once, and stores it - or, if the environment can't finish the job,
+writes nothing and names the one variable that would.
+
+| file | contents |
+|---|---|
+| `~/.config/lantern/credentials` | the key, mode `0600` - never in the database, logs, traces or reports |
+| `~/.config/lantern/config.json` | provider, model, endpoint - no secret |
+
+**The tools**, in order, each through the same audited executor (argv
+arrays, no shell, rlimits, timeouts, one row per command) - and each step
+degrades to a printed warning rather than blocking when it can't proceed
+(no `sudo`, no `apt`, offline mode, wrong architecture):
+
+1. **distribution packages** - `nmap`, `sqlmap`, `nikto`, `hydra`, `tcpdump`,
+   `bubblewrap`, `gobuster`, `amass` via `apt-get`, only what's missing, only
+   with passwordless `sudo`.
+2. **john (jumbo)**, built from source - 328 formats instead of a
+   distribution package's handful.
+3. **nuclei** - the release binary for the host's architecture, plus a
+   sparse clone of the CVE template set (4,348 files, 33 MB).
+4. **testssl.sh** - a shallow clone (it ships no compiled binary).
+5. **the exploit framework** - signing key, signed repository, ~754 MB
+   package.
+6. **AD/Impacket tooling and kube-hunter** (`GetUserSPNs.py`, `GetNPUsers.py`,
+   `crackmapexec`, `bloodhound-python`, `kube-hunter`) - via
+   `pip3 install --user`, since none of these ship an exact-named
+   distribution package.
+
+Everything lands in your package manager's own directories, in
+`~/.local/share/lantern-tools/` (deliberately **outside** the capped data
+root), or in `~/.local/bin` (pip's `--user` scripts; the restricted `PATH`
+reaches it). The last step also links the `lantern` binary itself into
+`~/.local/bin` - a symlink, so a rebuild never leaves a stale copy behind,
+and when that directory isn't on `PATH` yet the export line is printed
+rather than written into your shell startup files behind your back.
 
 ### Every command
 
@@ -103,7 +148,7 @@ lantern daemon [--interval SECS]                  # poll the queue, run jobs una
 ## Architecture
 
 ```
-lantern-cli     CLI: setup / doctor / run / ask / chat / flows / report / tools / gc
+lantern-cli     CLI: setup / doctor / run / ask / chat / flows / report / tools / gc / queue / daemon
 lantern-agent   roles, prompts, the tool-calling loop, intent parsing, reports
 lantern-tools   native tools, sandboxed host exec, bounded network fetches, the tool registry
 lantern-llm     chat clients (OpenAI-compatible, Anthropic), embeddings, context window
@@ -120,51 +165,36 @@ scripted provider so the loop is testable without spending anything.
 Six roles run in a set order on every flow - `orchestrator → planner →
 researcher → coder → pentester → reflector` - each a bounded tool-calling
 loop against the configured model. The pipeline itself is fixed: no role
-adds, removes, or reorders another role, and that is what makes a run's
-cost and shape predictable before you start it (`--dry-run` prints the
-exact token/tool-call estimate).
+adds, removes, or reorders another role, which is what makes a run's cost
+and shape predictable before you start it (`--dry-run` prints the exact
+token/tool-call estimate).
 
 Within that fixed pipeline, researcher/coder/pentester can call
 `delegate_task` to spin off one bounded sub-investigation and get back a
-condensed answer - Lantern's answer to Claude Code's `Task` tool or
-opencode's agent types, deliberately narrower than either:
+condensed answer - narrower, deliberately, than Claude Code's `Task` tool or
+opencode's agent types:
 
 - A delegated sub-task's tools can only be a subset of the **calling role's
-  own** tool list - it can never reach a tool the parent didn't already have,
-  so delegation cannot be used to smuggle in capability.
-- It shares the parent's scope and `--offensive` grant exactly; it cannot
-  exceed either (it is still just a role, running through the same
-  `Registry::execute` choke point as every other tool call).
-- **It cannot delegate again.** `delegate_task` is never in a delegated
-  sub-task's own tool list - not a depth counter that could have an off-by-
-  one, an absent capability - enforced twice over: the sub-task's model
-  literally has no schema for the tool, and the one place a tool call named
-  `delegate_task` could still be handled refuses it by name instead.
+  own** tool list - it can never reach a tool the parent didn't already have.
+- It shares the parent's scope and `--offensive` grant exactly, through the
+  same `Registry::execute` choke point every tool call goes through.
+- **It cannot delegate again** - enforced twice over: the sub-task's model
+  has no schema for `delegate_task`, and the one place a call named that
+  could still be handled refuses it by name.
 - Capped at 5 steps per call, 10 total across every `delegate_task` call one
-  role makes in its own turn - a role cannot multiply its own step budget
-  unboundedly by calling it repeatedly.
-- Fully audited the same way everything else is: a delegation skips
-  `Registry::execute` (the real work needs to call the model, which
-  `lantern-tools` has no access to), which is also where every other tool
-  call's database event gets written - so it logs its own start/finish
-  event the same way, rather than existing only in the live progress
-  stream. Its own nested tool calls still go through `Registry::execute`
-  normally and are audited exactly like any other call. Token/cost counters
-  already aggregate correctly since a delegated call is still just a call
-  to `agent.chat()`.
-- Visible in `chat` as its own nested block, not flattened into the
-  parent's own tool-call list: `↳ researcher delegates: "..."`, its tool
-  calls indented one level further than a direct call, `↳ ✓ sub-task done -
-  N step(s)` closing the block - the same thing Claude Code's `Task` tool or
-  opencode's sub-agent panels show, inline rather than collapsible (this
-  viewport is six rows, not a scrollback pane).
+  role makes in its own turn.
+- Fully audited: its own start/finish event is logged the same way every
+  other tool call's is, and its nested tool calls go through
+  `Registry::execute` normally.
+- Visible in `chat` as its own nested block: `↳ researcher delegates: "..."`,
+  its tool calls indented one level further, `↳ ✓ sub-task done - N step(s)`
+  closing the block.
 
-What this is not: open-ended, recursive, or dynamic task decomposition. A
-role decides to delegate one sub-question; it does not restructure the
-pipeline, spawn an unbounded tree of agents, or hand a sub-task anything
-it couldn't already reach itself. `Registry::defs_for` still scopes every
-role (and every delegated sub-task) to a fixed, auditable tool list (below)
-rather than "whatever the model decides to reach for."
+What this is not: open-ended or recursive task decomposition. A role decides
+to delegate one sub-question; it does not restructure the pipeline or hand a
+sub-task anything it couldn't already reach itself. `Registry::defs_for`
+scopes every role (and every delegated sub-task) to a fixed, auditable tool
+list - the one below - rather than "whatever the model decides to reach for."
 
 | Role | Does | Tools |
 |---|---|---|
@@ -185,7 +215,7 @@ TOOLS:` in the system prompt is an enforced fact, not just a hint.
 
 `lantern ask`/`chat` layer natural language on top without touching that
 structure: a detailed prompt can earn a role extra steps within its own
-budget (`step_boosts`, capped) and shape *how* a role is told to think (an
+budget (capped), and shape *how* a role is told to think (an
 `EngagementProfile` - web app, API, internal/AD, cloud, network -
 contributes a short addendum naming the right taxonomy and what this
 toolset honestly cannot check yet), but it never adds a role, removes one,
@@ -195,20 +225,22 @@ or grants a tool a role doesn't already have.
 
 **In-process** (no child process, so no host-tool sandboxing applies - these
 are plain Rust): `port_scan`, `dns_lookup`, `subdomain_enum` (passive
-certificate-transparency lookup via crt.sh - never touches target
-infrastructure; candidates are labelled in/out of scope, never auto-added to
-it), `http_probe`, `tls_inspect`, `waf_fingerprint` (CDN/WAF signature match
-from one ordinary response - no payloads; run this before trusting a
-zero-finding `sqlmap`/`nuclei` scan, since a silent WAF block looks
-identical to a clean application), `secret_scan` (regex match for
-credential-shaped strings in text another tool already captured - no network
-access of its own, every match reported masked), `whois`, `dir_bruteforce`
-(built-in 2,419-entry wordlist), `web_search` (DuckDuckGo by default, a
-search API if configured; `mode: vulnerability` surfaces matching NVD CVEs
-first), `memory_search`, `memory_store`, `ask_operator` (`--interactive`
-only), `plan_patch`, `delegate_task` (one bounded sub-investigation for
-researcher/coder/pentester - see
-[Roles and delegation](#roles-and-delegation-a-fixed-pipeline-with-one-bounded-escape-hatch)).
+certificate-transparency lookup via crt.sh), `http_probe`, `tls_inspect`,
+`waf_fingerprint` (CDN/WAF signature match from one ordinary response - run
+this before trusting a zero-finding `sqlmap`/`nuclei` scan, since a silent
+WAF block looks identical to a clean application), `secret_scan` (regex
+match for credential-shaped strings in text another tool already captured),
+`api_schema_scan` (parses an OpenAPI/Swagger JSON document, flags endpoints
+with no declared authentication), `graphql_introspect` (reports whether
+GraphQL introspection is enabled and, if so, the real type/query/mutation
+surface), `cloud_bucket_check` (credential-free check of whether an S3/Azure
+Blob/GCS bucket allows anonymous listing), `container_expose_check`
+(unauthenticated Docker daemon API or Kubelet anonymous auth), `whois`,
+`dir_bruteforce` (built-in 2,419-entry wordlist), `web_search` (DuckDuckGo by
+default; `mode: vulnerability` surfaces matching NVD CVEs first),
+`memory_search`, `memory_store`, `ask_operator` (`--interactive` only),
+`plan_patch`, `delegate_task` (see [Roles and
+delegation](#roles-and-delegation-a-fixed-pipeline-with-one-bounded-escape-hatch)).
 
 **One sandboxed child, not a host binary**: `code_run` - a single Python
 script (standard library only) behind `bwrap`, empty network namespace,
@@ -230,18 +262,24 @@ never reach a target.
 | `amass` | active subdomain enumeration (active DNS, optional `-brute`) | `--offensive` + scope |
 | `msfconsole` | one module (`use`/`set`/`run`\|`check`), one argv element | `--offensive` + scope |
 | `john` | offline cracking: wordlist, optional rules, then `--show` | `--offensive` |
+| `GetUserSPNs.py` | Kerberoasting - dumps crackable TGS hashes (Impacket) | `--offensive` + scope |
+| `GetNPUsers.py` | AS-REP Roasting - dumps crackable hashes (Impacket) | `--offensive` + scope |
+| `crackmapexec` | SMB/WinRM/LDAP enumeration and credential validation, read-only modules only | `--offensive` + scope |
+| `bloodhound-python` | AD relationship collection for BloodHound | `--offensive` + scope |
+| `kube-hunter` | active Kubernetes attack-vector probing | `--offensive` + scope |
 
 Each adapter builds its own argument array - the model never supplies raw
 flags, so it cannot smuggle `-oN /etc/passwd` through. A few specifics worth
 knowing: `msfconsole`'s session string is assembled from a validated module
 path and character-filtered option values, so no option can chain a second
 console command; `nuclei` runs with `-no-interactsh` so no callback leaves
-for a third party; `gobuster` falls back to the same bundled wordlist
-`dir_bruteforce` uses when no custom one is given; `tcpdump` alone holds
-`cap_net_raw,cap_net_admin` and the `lantern` binary itself stays
-unprivileged; `testssl.sh` ships no compiled binary - the kernel's shebang
-handling runs it via `execve`, the same shape as `python3 script.py` in
-`code_run`, with no shell interpolation anywhere in that path.
+for a third party; `crackmapexec`'s `enum_flag` is a closed allowlist of
+read-only modules - no execution method (`-x`/`-X`/`--exec-method`) is ever
+accepted; `tcpdump` alone holds `cap_net_raw,cap_net_admin` and the `lantern`
+binary itself stays unprivileged; `testssl.sh` ships no compiled binary - the
+kernel's shebang handling runs it via `execve`, the same shape as
+`python3 script.py` in `code_run`, with no shell interpolation anywhere in
+that path.
 
 ## Scope: hostnames, CIDR, and DNS drift
 
@@ -255,171 +293,93 @@ treats each correctly rather than as interchangeable strings:
 - **A hostname is resolved immediately before the command runs**, and the
   resolved address is written to the audit row (`resolved_ips`, visible in
   `lantern report`) regardless of outcome. When `--scope` itself names IP
-  ranges - the configuration this doc recommends - a hostname resolving
-  outside every one of them is refused instead of silently scanned, catching
-  DNS drift or rebinding between scope declaration and execution. A scope
-  defined purely by hostname skips this extra check; there is nothing to
-  compare the resolved address against.
+  ranges, a hostname resolving outside every one of them is refused instead
+  of silently scanned, catching DNS drift or rebinding between scope
+  declaration and execution. A scope defined purely by hostname skips this
+  extra check; there is nothing to compare the resolved address against.
 - This narrows, but cannot fully close, the gap between Lantern's check and
   a host tool's own connection: `nmap`/`nikto`/`sqlmap` resolve DNS
   internally, and pinning a third-party binary to one address would break
   vhost-based tools that need the hostname intact for `Host`/SNI. Put the
   resolved IP in `--scope` alongside the hostname for the tightest guarantee.
 
-## Concurrency and multiple sessions
+## Concurrency, sessions, and the daemon
 
-Yes - more than one `lantern run`/`ask`/`chat` can point at the same data
-root at once (SQLite runs in WAL, which is built for exactly this), and
-that's an ordinary thing to happen, not an edge case: a scheduled job and an
-operator both touching the same box, or two operators on a shared machine.
-A few things worth knowing about what that does and doesn't guarantee:
+More than one `lantern run`/`ask`/`chat` can point at the same data root at
+once (SQLite runs in WAL, built for exactly this) - a scheduled job and an
+operator both touching the same box, or two operators on a shared machine,
+is an ordinary thing to happen, not an edge case:
 
 - **Flow and task IDs are collision-safe across processes.** Each id mixes a
-  millisecond timestamp, the OS pid, and a per-process counter
-  (`lantern_core::ids`) specifically so two processes starting in the same
-  millisecond - the normal case for "launch two assessments at once" - can
-  never produce the same flow id. (An earlier version of this scheme mixed
-  in only the timestamp and a counter that reset to zero on every process
-  start, which could collide outright; fixed and covered by a direct test.)
+  millisecond timestamp, the OS pid, and a per-process counter, so two
+  processes starting in the same millisecond can never produce the same
+  flow id.
 - **The disk budget is best-effort across processes, not exact.** Each
   process tracks its own view of how much of `LANTERN_DATA_CAP_MB` is used,
-  seeded from the on-disk size at its own startup; two long-running
-  concurrent flows writing heavily will not see each other's writes in
-  real time. This is a soft cap on space, not a security boundary - the
-  actual hard limits (`RLIMIT_AS` per child, bounded HTTP reads, the disk
-  floor `lantern setup` itself enforces) are per-process already and
-  unaffected. `lantern gc`/the floor check resync against the real
-  filesystem and will catch up.
-- **No single-instance lock exists or is needed.** There is nothing to
-  coordinate: each flow is independent, scope-checked and budgeted on its
-  own, and the database is the only shared state.
+  seeded at its own startup. This is a soft cap on space, not a security
+  boundary - the actual hard limits (`RLIMIT_AS` per child, bounded HTTP
+  reads, the disk floor `lantern setup` enforces) are per-process already.
+  `lantern gc` resyncs against the real filesystem.
+- **No single-instance lock exists or is needed.** Each flow is independent,
+  scope-checked and budgeted on its own; the database is the only shared
+  state.
 
-For unattended/scheduled assessment, `lantern queue add` plus `lantern
-daemon` is the same story at the level of whole flows instead of one
-process: `lantern queue add` from any invocation and a long-running
-`lantern daemon` elsewhere coordinate through nothing but that same shared
-SQLite file (`Db::claim_next_queued` is a locked SELECT immediately
-followed by an UPDATE, so two daemons against the same data root can never
-claim the same job twice). The daemon is a polling loop, not a server: it
-opens no listening socket, and SIGINT/SIGTERM both let the job in progress
-finish before it exits.
+**Unattended/scheduled assessment** is the same story at the level of whole
+flows: `lantern queue add` (from any invocation) and a long-running
+`lantern daemon` (elsewhere) coordinate through nothing but that shared
+SQLite file. `Db::claim_next_queued` is a locked `SELECT` immediately
+followed by an `UPDATE`, so two daemons against the same data root can never
+claim the same job twice; jobs run one at a time, through the exact same
+`run::run` path `lantern run` itself uses. The daemon is a polling loop, not
+a server - it opens no listening socket - and SIGINT/SIGTERM both let the
+job in progress finish before it exits.
 
 ### Session lifecycle: create, read, update, delete
 
 A "session" in `lantern chat` is its live settings (`target`, `scope`,
 `roles`, `offensive`, `dry-run`, `steps`) plus whatever flows you run under
 them; each flow it starts is its own row in the database, independent of
-the session that created it. Full lifecycle control, all from inside the
-TUI - no need to quit and relaunch to start over, and no file-system
-spelunking to clean up after yourself:
+the session that created it.
 
 | | command | does |
 |---|---|---|
-| **Create** | `/new` | resets the session's settings to blank - a fresh target, scope, roles, offensive grant and step cap, ready for the next engagement. Nothing is deleted: every flow already run stays exactly as it was. |
-| **Read** | `/flows` | lists recorded flows (id, status, target) - the same data `lantern flows` shows outside chat. |
-| **Update** | `/target`, `/scope`, `/roles`, `/offensive`, `/dry-run`, `/steps` | change one setting of the live session; each takes effect on the next instruction. |
-| **Delete** | `/delete <flow-id> yes` | **permanently** removes one flow: every database row across every table in one transaction (`Db::delete_flow`), its artifact files, its working directory, its rendered report. Typing just `/delete <flow-id>` shows what would be destroyed and refuses - the `yes` has to be deliberate, there is no retention window behind this the way there is behind `lantern gc`'s scheduled pruning. |
+| **Create** | `/new` | resets the session's settings to blank - nothing already run is deleted. |
+| **Read** | `/flows` | lists recorded flows (id, status, target) - same as `lantern flows` outside chat. |
+| **Update** | `/target`, `/scope`, `/roles`, `/offensive`, `/dry-run`, `/steps` | change one setting of the live session, effective on the next instruction. |
+| **Delete** | `/delete <flow-id> yes` | **permanently** removes one flow: every database row across every table in one transaction, its artifact files, its working directory, its rendered report. Typing just `/delete <flow-id>` shows what would be destroyed and refuses. |
 
 The same delete is available outside chat as `lantern delete <flow-id>
---yes` (same confirmation requirement, same transaction). Deleting one flow
-never touches another - verified directly, not just assumed, in both the
-database layer (`delete_flow`'s own tests) and live, under a real terminal,
-with two flows from two separate `/new` sessions and only one deleted.
-
-What Lantern does **not** currently do: run as a long-lived daemon or
-systemd service, or expose a queue/scheduler of its own. It is a CLI
-invoked per assessment. A systemd timer calling `lantern ask` on a schedule
-works today with no code changes; a first-class `lantern daemon` with its
-own queue is a reasonable next build if continuous/scheduled assessment
-matters to how your firm runs it.
+--yes`. Deleting one flow never touches another - verified both in the
+database layer and live, under a real terminal, with two flows from two
+separate `/new` sessions and only one deleted.
 
 ## Detectability and the agent's own attack surface
 
-**Can the target detect it?** Partially, by design on the recon side:
+**Target-side detection** is partial, by design, on the recon side:
 `http_probe`, `waf_fingerprint`, `dir_bruteforce` and `web_search` send
 `User-Agent: lantern/<version>` by default - honest, self-identifying
-traffic, consistent with the audit-everything stance everywhere else, and
-useful when an engagement wants a defender's SOC to be able to attribute the
-traffic. Override it with `LANTERN_USER_AGENT` when blending in is itself
-part of the test. What overriding it does **not** buy: `nikto` is loud and
-signature-heavy by its own design, `nmap`'s scan timing is its own
-fingerprint, `sqlmap` already runs with `--random-agent`. No header changes
-any of that.
+traffic, useful when an engagement wants a defender's SOC to attribute it.
+Override with `LANTERN_USER_AGENT` when blending in is itself part of the
+test - though that buys nothing against `nikto`'s own loud signature, `nmap`'s
+own scan timing, or `sqlmap`'s own `--random-agent`.
 
-**Does it leave traces?** Yes, extensively, on the machine running it - the
-entire audit value proposition, not a flaw. Every command (binary, full
-argv, exit code, resolved IP) lands in `lantern.db` and a JSONL trace file;
-artifacts and reports are plain files under the data root. Anyone with read
+**Traces on the Lantern host** are extensive - the entire audit value
+proposition, not a flaw. Every command (binary, full argv, exit code,
+resolved IP) lands in `lantern.db` and a JSONL trace file; anyone with read
 access to that box can reconstruct the whole engagement. Traces *on the
-target* are a property of the allowlisted tools themselves - identical to
+target* are a property of the allowlisted tools themselves, identical to
 running `nmap`/`nikto`/`sqlmap` by hand.
 
-**Is the agent itself secure, or just a vulnerable pentester?** The
-adversarial direction worth checking is a hostile or compromised *target*
-attacking the agent back through its own response parsing. Every in-process
-network fetch (`http_probe`, `waf_fingerprint`, `dir_bruteforce`,
-`subdomain_enum`, `web_search`) is bounded at the read itself
-(`lantern_tools::fetch`) rather than truncated after the whole response was
-already buffered - none of that code runs under the `RLIMIT_AS` that
-protects a sandboxed host-tool child, so a target serving a multi-gigabyte
-or endlessly chunked response cannot force unbounded memory growth in the
-process itself. Verified against a real oversized response from a local TCP
-listener in `fetch.rs`'s tests, not just reasoned about. The same bound
-applies, at a more generous cap, to the model-provider responses
-(`lantern_llm::fetch`) and the setup wizard's model-list fetch - a lower-risk
-tier (operator-configured, not the target), bounded anyway rather than left
-as the one unbounded read in the codebase.
-
-## Setup
-
-`lantern setup` is the whole installation story: on a fresh machine it asks
-the three questions only you can answer and provisions what's missing; on an
-already-configured machine it reports everything present and changes
-nothing. Re-running it is free.
-
-**The model half** comes first (it's one API call; the tools can take
-minutes). It lists providers, fetches the endpoint's own live model list,
-reads the key with input hidden, and spends one real completion verifying it
-works before storing it - a key that cannot reach its endpoint is not worth
-saving. With no terminal attached (a script, CI), it takes whatever the
-environment already provides, checks it once, and stores it - or, if the
-environment can't finish the job, writes nothing and names the one variable
-that would.
-
-| file | contents |
-|---|---|
-| `~/.config/lantern/credentials` | the key, mode `0600` - never in the database, logs, traces or reports |
-| `~/.config/lantern/config.json` | provider, model, endpoint - no secret |
-
-**The tools**, in order, each through the same audited executor (argv
-arrays, no shell, rlimits, timeouts, one row per command) - and each step
-degrades to a printed warning rather than blocking when it can't proceed
-(no `sudo`, no `apt`, offline mode, wrong architecture):
-
-1. **distribution packages** - `nmap`, `sqlmap`, `nikto`, `hydra`, `tcpdump`,
-   `bubblewrap`, `gobuster`, `amass` via `apt-get`, only what's missing, only
-   with passwordless `sudo`.
-2. **john (jumbo)**, built from source - 328 formats instead of a
-   distribution package's handful.
-3. **nuclei** - the release binary for the host's architecture.
-4. **the CVE template set** - a sparse clone (4,348 files, 33 MB), not the
-   whole template repository.
-5. **testssl.sh** - a shallow clone (it ships no compiled binary).
-6. **the exploit framework** - signing key, signed repository, ~754 MB
-   package.
-
-Everything lands in your package manager's own directories or in
-`~/.local/share/lantern-tools/` (deliberately **outside** the capped data
-root, so provisioning never competes with logs/artifacts/findings for
-space). The last step links the binary into `~/.local/bin` - a symlink, so a
-rebuild never leaves a stale copy behind, and when that directory isn't on
-`PATH` yet the export line is printed rather than written into your shell
-startup files behind your back.
-
-**Installing packages is something `lantern setup` does - never `run`,
-`ask`, or `chat`.** Those three only check what's already resolvable on the
-restricted `PATH`; nothing in the assessment path ever shells out to a
-package manager.
+**Against a hostile or compromised target attacking the agent back**: every
+in-process network fetch (`http_probe`, `waf_fingerprint`, `dir_bruteforce`,
+`subdomain_enum`, `web_search`, `api_schema_scan`, `graphql_introspect`,
+`cloud_bucket_check`, `container_expose_check`) is bounded at the read
+itself (`lantern_tools::fetch`) rather than truncated after the whole
+response was already buffered - none of that code runs under the
+`RLIMIT_AS` that protects a sandboxed host-tool child, so a target serving a
+multi-gigabyte or endlessly chunked response cannot force unbounded memory
+growth in the process itself. The same bound applies, at a more generous
+cap, to model-provider responses (`lantern_llm::fetch`).
 
 ## Environment variables
 
@@ -444,7 +404,7 @@ preset**.
 | `LANTERN_MAX_OUTPUT_BYTES` | `2097152` | captured output cap per command |
 | `LANTERN_CHILD_MEM_MB` / `LANTERN_CHILD_CPU_SECS` | device-derived (`512`) / `60` | child rlimits |
 | `LANTERN_PATH` | `/usr/local/bin:/usr/bin:/bin` + tools dirs | restricted `PATH` for children |
-| `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john,bwrap,testssl.sh,gobuster,amass` | host binaries that may run |
+| `LANTERN_ALLOWLIST` | `nmap,sqlmap,nikto,hydra,tcpdump,nuclei,msfconsole,john,bwrap,testssl.sh,gobuster,amass,GetUserSPNs.py,GetNPUsers.py,crackmapexec,bloodhound-python,kube-hunter` | host binaries that may run |
 | `LANTERN_TOOLS_DIR` | `~/.local/share/lantern-tools` | where `setup` provisions tools |
 | `LANTERN_NUCLEI_TEMPLATES` | `<tools-dir>/share/nuclei-templates` | template set for `host_nuclei` |
 | `LANTERN_OPERATOR_ANSWER` | - | reply for `ask_operator` with no terminal |
@@ -483,7 +443,7 @@ re-running `lantern setup`, or override per-run with `LANTERN_LLM_MODEL=...`.
 
 ```
 ~/.local/share/lantern/
-├── lantern.db          # flows, tasks, commands, findings, memory (FTS5), events
+├── lantern.db          # flows, tasks, commands, findings, memory (FTS5), events, queue
 ├── logs/                # rotating text log, size-capped
 ├── traces/              # JSONL audit trace, pruned by age
 ├── artifacts/           # raw tool output per flow, gzip-compressed after 7 days
@@ -494,11 +454,10 @@ re-running `lantern setup`, or override per-run with `LANTERN_LLM_MODEL=...`.
 The tools directory lives **outside** this root. Storage rules, in order:
 writes refuse before `LANTERN_DATA_CAP_MB`; `lantern setup` alone refuses to
 start below the 20% disk floor (it's the only step that downloads/builds
-gigabytes - `run`/`ask`/`chat`/`gc` work at any free space); artifacts
-gzip after 7 days and delete once compressed; traces prune after 14 days,
-logs after 30; SQLite runs WAL with incremental auto-vacuum plus a
-conditional full `VACUUM` under the free-space threshold; findings are kept
-forever.
+gigabytes); artifacts gzip after 7 days and delete once compressed; traces
+prune after 14 days, logs after 30; SQLite runs WAL with incremental
+auto-vacuum plus a conditional full `VACUUM` under the free-space threshold;
+findings are kept forever.
 
 Each role's observations are stored with an embedding when Ollama is
 available (768-dim `nomic-embed-text`) and searched with a hybrid of FTS5
@@ -508,30 +467,13 @@ writes a note back; a note of kind `guide` lands in a shared namespace that
 outlives the engagement, so a lesson learned on one target is read by every
 flow after it.
 
-## Roadmap
+## Status
 
-The five gaps this section used to describe are now built:
-
-- **Internal/Active Directory tooling**: `host_getuserspns` (Kerberoasting),
-  `host_getnpusers` (AS-REP Roasting), `host_crackmapexec` (SMB/WinRM/LDAP
-  enumeration and credential validation - enumeration only, no execution
-  method is ever accepted), and `host_bloodhound` (BloodHound relationship
-  collection). All `--offensive`-gated, all provisioned by `lantern setup`.
-- **API-aware testing**: `api_schema_scan` parses an OpenAPI/Swagger JSON
-  document and reports which endpoints declare no authentication;
-  `graphql_introspect` reports whether GraphQL introspection is enabled and,
-  if so, the real type/query/mutation surface. Both passive.
-- **Cloud posture**: `cloud_bucket_check`, a credential-free outside-in
-  check of whether an S3 bucket, Azure Blob container, or GCS bucket allows
-  anonymous listing.
-- **Container/K8s**: `container_expose_check` (unauthenticated Docker daemon
-  API or Kubelet anonymous auth, passive) and `host_kubehunter`
-  (kube-hunter active probing, `--offensive`-gated).
-- **A real daemon mode**: `lantern queue add/list/remove` plus
-  `lantern daemon`, a polling loop against Lantern's own SQLite queue table
-  (never a listening socket) that runs jobs through the exact same path
-  `lantern run` already uses. See
-  [Concurrency and multiple sessions](#concurrency-and-multiple-sessions).
+Every gap this section used to list - internal/AD tooling, API-schema-aware
+testing, cloud posture, container/K8s exposure, a real daemon mode - is now
+built; see [Tools](#tools) and [Roles and
+delegation](#roles-and-delegation-a-fixed-pipeline-with-one-bounded-escape-hatch)
+for what each one does.
 
 What's still honestly missing: JWT-specific analysis, a structured
 OAuth/SAML flow tester, an IAM policy evaluator, and container-escape
