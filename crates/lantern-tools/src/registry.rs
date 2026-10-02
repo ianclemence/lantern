@@ -86,6 +86,8 @@ impl Registry {
             Arc::new(crate::tools::secret_scan::SecretScan),
             Arc::new(crate::tools::api_schema::ApiSchemaScan),
             Arc::new(crate::tools::graphql_introspect::GraphQlIntrospect),
+            Arc::new(crate::tools::cloud_posture::CloudBucketCheck),
+            Arc::new(crate::tools::container_expose::ContainerExposeCheck),
             Arc::new(crate::tools::delegate::DelegateTask),
             Arc::new(crate::tools::http_probe::HttpProbe),
             Arc::new(crate::tools::tls_inspect::TlsInspect),

@@ -224,6 +224,7 @@ fn default_allowlist() -> Vec<String> {
         "GetNPUsers.py",
         "crackmapexec",
         "bloodhound-python",
+        "kube-hunter",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -413,7 +414,7 @@ mod tests {
             vec![
                 "nmap", "sqlmap", "nikto", "hydra", "tcpdump", "nuclei", "msfconsole", "john",
                 "bwrap", "testssl.sh", "gobuster", "amass", "GetUserSPNs.py", "GetNPUsers.py",
-                "crackmapexec", "bloodhound-python"
+                "crackmapexec", "bloodhound-python", "kube-hunter"
             ]
         );
         assert!(a.iter().all(|b| !b.contains('/') && !b.contains(' ')));

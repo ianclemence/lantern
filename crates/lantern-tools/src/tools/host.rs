@@ -118,6 +118,13 @@ pub fn host_tools() -> Vec<HostToolEntry> {
             offensive: true,
             default_args: vec![],
         },
+        HostToolEntry {
+            binary: "kube-hunter",
+            description: "ACTIVE: kube-hunter remote active probing of an in-scope Kubernetes \
+                           cluster for known attack vectors. Requires --offensive.",
+            offensive: true,
+            default_args: vec![],
+        },
     ]
 }
 
@@ -788,6 +795,13 @@ impl HostTool {
                     "--zip".into(),
                 ])
             }
+            "kube-hunter" => {
+                let host = super::str_field(input, "host")?;
+                if !valid_dc_target(&host) && !is_bare_cidr(&host) {
+                    anyhow::bail!("invalid host for kube-hunter");
+                }
+                Ok(vec!["--remote".into(), host, "--report".into(), "json".into()])
+            }
             other => anyhow::bail!("no argument builder for `{other}`"),
         }
     }
@@ -868,6 +882,7 @@ impl HostTool {
             "GetNPUsers.py" => 120,
             "crackmapexec" => 180,
             "bloodhound-python" => 600,
+            "kube-hunter" => 300,
             _ => 120,
         })
     }
@@ -1070,6 +1085,14 @@ impl HostTool {
                     format!("bloodhound-python: exit {:?}", out.exit_code)
                 }
             }
+            "kube-hunter" => {
+                let hits = text.matches("\"vulnerability\"").count();
+                if hits == 0 {
+                    "kube-hunter: finished, no vulnerabilities reported".into()
+                } else {
+                    format!("kube-hunter: {hits} vulnerabilit(y/ies) reported")
+                }
+            }
             _ => {
                 let first = lines.first().unwrap_or(&"").to_string();
                 format!("{}: exit {:?} {}", self.entry.binary, out.exit_code, first)
@@ -1236,6 +1259,7 @@ impl Tool for HostTool {
             "GetNPUsers.py" => "host_getnpusers",
             "crackmapexec" => "host_crackmapexec",
             "bloodhound-python" => "host_bloodhound",
+            "kube-hunter" => "host_kubehunter",
             _ => "host_unknown",
         }
     }
@@ -1400,6 +1424,13 @@ impl Tool for HostTool {
                     "collection_method": {"type": "string", "description": "DCOnly|All|Group|Session|Trusts|ACL"}
                 },
                 "required": ["domain", "username", "password", "dc_ip"]
+            }),
+            "kube-hunter" => json!({
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "in-scope Kubernetes API/node host, IP, or CIDR"}
+                },
+                "required": ["host"]
             }),
             _ => json!({"type": "object", "properties": {}}),
         }
@@ -1592,6 +1623,7 @@ mod tests {
             "GetNPUsers.py",
             "crackmapexec",
             "bloodhound-python",
+            "kube-hunter",
         ] {
             assert!(entry(b).offensive, "{b} must require --offensive");
         }

@@ -3,6 +3,8 @@
 //! an allowlisted host binary.
 
 pub mod api_schema;
+pub mod cloud_posture;
+pub mod container_expose;
 pub mod dirb;
 pub mod delegate;
 pub mod dns;
