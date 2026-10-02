@@ -11,7 +11,7 @@
 //! from chat always run non-interactively - steer them with a typed line
 //! while they work instead.
 
-use lantern_agent::{intent, run_flow, AgentCtx, FlowOptions, ProgressEvent};
+use lantern_agent::{intent, run_flow, AgentCtx, FlowOptions, ProgressEvent, RoleId};
 use lantern_core::budget::{dir_size, Budget};
 use lantern_core::config::Config;
 use lantern_core::retention;
@@ -460,7 +460,38 @@ fn on_progress(ui: &mut Ui, ev: ProgressEvent) {
             let mark = if error { "!" } else { "✓" };
             push_trail(ui, format!("{mark} {} · {steps} steps", role.as_str()));
         }
+        // Nested one level deeper than a plain tool call, with its own
+        // glyphs, so a delegated sub-task reads as a distinct block in the
+        // trail - the same thing Claude Code's Task tool or opencode's
+        // sub-agent panels show, just inline rather than collapsible: this
+        // viewport is six rows, not a scrollback pane. Line text lives in
+        // pure functions below so it is tested directly, the same way
+        // `wrap_line`/`palette_matches` are, rather than only indirectly
+        // through a live `Running`.
+        ProgressEvent::DelegateStarted { parent, objective } => {
+            push_trail(ui, delegate_started_line(parent, &objective));
+        }
+        ProgressEvent::DelegatedToolCalled(name) => {
+            run.tools += 1;
+            push_trail(ui, delegated_tool_line(&name));
+        }
+        ProgressEvent::DelegateFinished { steps, error } => {
+            push_trail(ui, delegate_finished_line(steps, error));
+        }
     }
+}
+
+fn delegate_started_line(parent: RoleId, objective: &str) -> String {
+    format!("  ↳ {} delegates: \"{objective}\"", parent.as_str())
+}
+
+fn delegated_tool_line(name: &str) -> String {
+    format!("      → {name}")
+}
+
+fn delegate_finished_line(steps: usize, error: bool) -> String {
+    let mark = if error { "!" } else { "✓" };
+    format!("  ↳ {mark} sub-task done · {steps} step(s)")
 }
 
 // --- drawing ---------------------------------------------------------------------
@@ -1224,5 +1255,37 @@ mod tests {
         let lines = wrap_line("aaa bb ccccc", 6);
         assert_eq!(lines, vec!["aaa bb", "ccccc"]);
         assert_eq!(wrap_line("short", 100), vec!["short"]);
+    }
+
+    #[test]
+    fn delegation_renders_as_a_distinct_nested_block() {
+        // The exact thing this exists to prove: a delegated sub-task's own
+        // tool calls must not read the same as the parent role's direct
+        // calls (indentation/glyph differ at every level), and the block
+        // must be visually bracketed by a start and an end line - the same
+        // shape Claude Code's Task tool or opencode's sub-agent panels give
+        // their own nested activity, just inline in this six-row viewport
+        // rather than a collapsible pane.
+        let start = delegate_started_line(RoleId::Researcher, "resolve example.com");
+        let nested = delegated_tool_line("dns_lookup");
+        let top_level = {
+            // `ToolCalled`'s own formatting lives inline in on_progress, not
+            // a named function - reproduced here only to assert the
+            // relationship, not duplicated as a second source of truth.
+            format!("  → {}", "dns_lookup")
+        };
+        let finish_ok = delegate_finished_line(2, false);
+        let finish_err = delegate_finished_line(0, true);
+
+        assert!(start.contains("researcher"), "{start}");
+        assert!(start.contains("resolve example.com"), "{start}");
+        assert!(nested.len() > top_level.len(), "a delegated call must nest deeper: {nested:?} vs {top_level:?}");
+        assert!(nested.trim_start() == "→ dns_lookup", "{nested}");
+        assert!(finish_ok.contains('✓') && finish_ok.contains("2 step"), "{finish_ok}");
+        assert!(finish_err.contains('!'), "{finish_err}");
+        // Start and finish lines share a marker (↳) that no plain
+        // ToolCalled/RoleFinished line uses, so the block reads as one unit.
+        assert!(start.contains('↳') && finish_ok.contains('↳'));
+        assert!(!top_level.contains('↳'));
     }
 }

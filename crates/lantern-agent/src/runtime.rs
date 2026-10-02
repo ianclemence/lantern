@@ -30,6 +30,18 @@ pub enum ProgressEvent {
     RoleStarted(RoleId),
     ToolCalled(String),
     RoleFinished { role: RoleId, steps: usize, error: bool },
+    /// A role's `delegate_task` call passed validation and is about to run
+    /// its own bounded sub-loop. `objective` is clipped for display -
+    /// terminals don't want a 3,000-character line.
+    DelegateStarted { parent: RoleId, objective: String },
+    /// A tool call made *inside* a delegated sub-task, not by the parent
+    /// role directly - kept distinct from `ToolCalled` so a renderer can
+    /// nest/indent it under the `DelegateStarted` it belongs to, the way
+    /// this UI's own trail does, instead of flattening it into the parent's
+    /// own tool-call list with no indication of where it actually came from.
+    DelegatedToolCalled(String),
+    /// The delegated sub-task returned (successfully or not).
+    DelegateFinished { steps: usize, error: bool },
 }
 
 /// Where progress events go. `None` means nobody is watching.
@@ -839,6 +851,27 @@ async fn run_delegate_task(
         );
     }
 
+    emit(
+        opts,
+        ProgressEvent::DelegateStarted {
+            parent,
+            objective: lantern_core::text_clip(&objective, 140),
+        },
+    );
+    // A delegated call skips Registry::execute entirely (see the comment at
+    // its call site in role_loop), which is also where every other tool
+    // call's audit event gets written - so without this, the one fact that
+    // a delegation happened at all, to whom, and with what outcome would
+    // exist only in this process's live progress stream, never in the
+    // database every other tool call lands in. Logged the same way
+    // Registry::execute logs everything else (`ctx.event`, same "tool"
+    // kind), not a parallel audit mechanism of its own.
+    tool_ctx.event(
+        "info",
+        "tool",
+        &format!("delegate_task: {parent} -> {}", lantern_core::text_clip(&objective, 200)),
+        Some(json!({"tool": "delegate_task", "parent": parent.as_str(), "tools": tools, "max_steps": max_steps})),
+    );
     let result = delegated_loop(
         agent, parent, target, scope, &objective, &tools, max_steps, tool_ctx, memory, opts,
     )
@@ -847,9 +880,25 @@ async fn run_delegate_task(
     match result {
         Ok((text, spent)) => {
             *delegate_budget = delegate_budget.saturating_sub(spent);
+            emit(opts, ProgressEvent::DelegateFinished { steps: spent, error: false });
+            tool_ctx.event(
+                "info",
+                "tool",
+                &format!("delegate_task: {parent} sub-task finished in {spent} step(s)"),
+                Some(json!({"tool": "delegate_task", "parent": parent.as_str(), "ok": true, "steps": spent})),
+            );
             format!("DELEGATED SUB-TASK RESULT ({spent} step(s) spent):\n{text}")
         }
-        Err(e) => format!("TOOL ERROR: delegated sub-task failed: {e:#}"),
+        Err(e) => {
+            emit(opts, ProgressEvent::DelegateFinished { steps: 0, error: true });
+            tool_ctx.event(
+                "warn",
+                "tool",
+                &format!("delegate_task: {parent} sub-task failed: {e:#}"),
+                Some(json!({"tool": "delegate_task", "parent": parent.as_str(), "ok": false})),
+            );
+            format!("TOOL ERROR: delegated sub-task failed: {e:#}")
+        }
     }
 }
 
@@ -927,7 +976,7 @@ async fn delegated_loop(
                 ));
                 continue;
             }
-            emit(opts, ProgressEvent::ToolCalled(call.name.clone()));
+            emit(opts, ProgressEvent::DelegatedToolCalled(call.name.clone()));
             let body = match agent
                 .registry
                 .execute(&call.name, call.args(), tool_ctx)
@@ -1243,6 +1292,21 @@ mod tests {
             .roles(vec![RoleId::Researcher]);
         let out = run_flow(&agent, opts).await.expect("flow runs");
         assert!(out.findings >= 1, "the role still reaches its own findings: {out:?}");
+
+        // A delegation skips Registry::execute, which is also where every
+        // other tool call's audit event gets written - so this is the one
+        // thing that has to be asserted directly rather than inherited for
+        // free: the database, not just the live progress stream, must show
+        // that a delegation happened and how it ended.
+        let events = agent.db.events_for_flow(&out.flow_id).unwrap();
+        assert!(
+            events.iter().any(|e| e.message.starts_with("delegate_task: researcher ->")),
+            "no start event for the delegation: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e.message.contains("sub-task finished in 1 step")),
+            "no finish event for the delegation: {events:?}"
+        );
     }
 
     #[tokio::test]

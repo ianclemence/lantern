@@ -139,9 +139,21 @@ opencode's agent types, deliberately narrower than either:
 - Capped at 5 steps per call, 10 total across every `delegate_task` call one
   role makes in its own turn - a role cannot multiply its own step budget
   unboundedly by calling it repeatedly.
-- Fully audited the same way everything else is: its own task row, its own
-  tool-call events, token/cost counters that already aggregate correctly
-  since a delegated call is still just a call to `agent.chat()`.
+- Fully audited the same way everything else is: a delegation skips
+  `Registry::execute` (the real work needs to call the model, which
+  `lantern-tools` has no access to), which is also where every other tool
+  call's database event gets written - so it logs its own start/finish
+  event the same way, rather than existing only in the live progress
+  stream. Its own nested tool calls still go through `Registry::execute`
+  normally and are audited exactly like any other call. Token/cost counters
+  already aggregate correctly since a delegated call is still just a call
+  to `agent.chat()`.
+- Visible in `chat` as its own nested block, not flattened into the
+  parent's own tool-call list: `↳ researcher delegates: "..."`, its tool
+  calls indented one level further than a direct call, `↳ ✓ sub-task done -
+  N step(s)` closing the block - the same thing Claude Code's `Task` tool or
+  opencode's sub-agent panels show, inline rather than collapsible (this
+  viewport is six rows, not a scrollback pane).
 
 What this is not: open-ended, recursive, or dynamic task decomposition. A
 role decides to delegate one sub-question; it does not restructure the
